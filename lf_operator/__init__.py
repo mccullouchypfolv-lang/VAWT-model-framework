@@ -1,1 +1,1 @@
-"""Low-fidelity section-to-rotor operators."""
+"""Parameter-only single-blade LF surrogate and conditional HF residual operators."""

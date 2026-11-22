@@ -3,3 +3,14 @@
 __pycache__/
 artifacts/
 *.pyc
+tmp/
+tmp*/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.log
+*.png
+*.pdf
+*.zip

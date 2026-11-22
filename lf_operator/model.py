@@ -1,5 +1,6 @@
 """Mixed-boundary 2D-to-1D FiLM Fourier neural operator."""
 import math
+import numbers
 
 import torch
 from torch import nn
@@ -59,16 +60,19 @@ class FiLMBlock(nn.Module):
 
 
 class FiLMFNO(nn.Module):
-    def __init__(self,n_features=6,n_conditions=4,width=32,blocks=4,
-                 modes_z=6,modes_theta=12,pad_z=6):
+    def __init__(self,n_features=2,n_conditions=2,width=32,blocks=4,
+                 modes_z=6,modes_theta=12,pad_z=6,n_outputs=3):
         super().__init__()
+        if isinstance(n_outputs, bool) or not isinstance(n_outputs, numbers.Integral) or n_outputs < 1:
+            raise ValueError('n_outputs must be a positive integer')
         if min(n_features,n_conditions,width,blocks) < 1 or not 0 <= pad_z < 20:
             raise ValueError('invalid model dimensions or height reflection padding')
         self.config = dict(n_features=n_features,n_conditions=n_conditions,width=width,
-                           blocks=blocks,modes_z=modes_z,modes_theta=modes_theta,pad_z=pad_z)
+                           blocks=blocks,modes_z=modes_z,modes_theta=modes_theta,pad_z=pad_z,
+                           n_outputs=n_outputs)
         self.lift = nn.Conv2d(n_features+3,width,1)
         self.blocks = nn.ModuleList([FiLMBlock(width,n_conditions,modes_z,modes_theta,pad_z) for _ in range(blocks)])
-        self.head = nn.Sequential(nn.Conv1d(width,width,1),nn.GELU(),nn.Conv1d(width,2,1))
+        self.head = nn.Sequential(nn.Conv1d(width,width,1),nn.GELU(),nn.Conv1d(width,n_outputs,1))
 
     def forward(self,x,a,z,theta,weights,return_features=False):
         if x.ndim != 4 or x.shape[1] != 20 or x.shape[2] != self.config['n_features']:

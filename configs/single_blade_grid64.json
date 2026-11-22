@@ -1,0 +1,7 @@
+{
+  "wind_ref_m_s": {"min": 8.0, "max": 20.0, "count": 64},
+  "tsr_ref": {"min": 1.5, "max": 6.0, "count": 64},
+  "chord_m": 4.9,
+  "thickness_ratio": 0.16,
+  "n_theta": 64
+}
