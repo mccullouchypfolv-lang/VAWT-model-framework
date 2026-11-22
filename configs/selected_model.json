@@ -1,0 +1,20 @@
+{
+  "selected_by_user": true,
+  "architecture": "FiLM-FNO with direct LF/height concatenation",
+  "config": "configs/single_blade.json",
+  "checkpoint": "artifacts/single_blade_parameters_v1/stage3_film_concat_dopri5_e2000/best.pt",
+  "checkpoint_sha256": "d179895a291f19bfc10016d532b6e7a252fd2eeca10d4f40fda73ee07a44b719",
+  "work": "artifacts/single_blade_parameters_v1",
+  "flow_output": "stage3_film_concat_dopri5_e2000",
+  "modes": 12,
+  "best_epoch": 515,
+  "epochs_run": 605,
+  "configured_epoch_limit": 2000,
+  "hf_split": "geometry",
+  "hf_split_counts": {
+    "train": 32,
+    "val": 9,
+    "test": 8
+  },
+  "version": "v1"
+}

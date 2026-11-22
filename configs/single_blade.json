@@ -2,7 +2,7 @@
   "hf_root": "../仿真/High-fidelity/num49/results_origin_detailed/results_origin_detailed",
   "lf_source": "../仿真/dataset/outputs/results_PC_momentum_c1",
   "lf_inputs": "../仿真/dataset/outputs/seed1492_n1000_inputs/cases.csv",
-  "work": "artifacts/single_blade_parameters_lhs_seed42",
+  "work": "artifacts/single_blade_parameters_v1",
   "device": "cuda",
   "seed": 42,
   "batch_size": 256,
@@ -58,10 +58,5 @@
   },
   "flow_output": "stage3_film_concat_dopri5_e2000",
   "flow_weight_decay": 0.001,
-  "flow_lr_gamma": 1.0,
-  "hf_split": {
-    "method": "latin_hypercube",
-    "val_fraction": 0.15,
-    "test_fraction": 0.15
-  }
+  "flow_lr_gamma": 1.0
 }
