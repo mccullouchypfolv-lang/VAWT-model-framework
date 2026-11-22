@@ -5,6 +5,19 @@ from lf_operator.blade_pipeline import validate_flow_assets
 
 
 class BladePipelineTests(unittest.TestCase):
+    def test_flow_early_stopping_counts_epochs_and_accumulates_small_improvements(self):
+        from lf_operator.blade_pipeline import FlowEarlyStopping
+        monitor=FlowEarlyStopping(patience=90,min_delta=1e-4)
+        monitor.observe(1,1.)
+        monitor.observe(5,.99995)
+        self.assertFalse(monitor.should_stop(90))
+        self.assertTrue(monitor.should_stop(91))
+        monitor.observe(10,.9998)
+        self.assertFalse(monitor.should_stop(99))
+        self.assertTrue(monitor.should_stop(100))
+        for kwargs in [dict(patience=0,min_delta=1e-4),dict(patience=90,min_delta=-1),dict(patience=90,min_delta=float('nan'))]:
+            with self.assertRaises(ValueError):FlowEarlyStopping(**kwargs)
+
     def test_zero_velocity_evaluates_same_source_and_mean_on_new_grids(self):
         import torch
         from lf_operator.residual_flow import ConditionalVelocity

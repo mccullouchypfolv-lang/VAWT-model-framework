@@ -7,6 +7,7 @@
 ## 新旧速度场
 
 - 新模型：`lf_operator/residual_flow.py`。独立线性旁路 + 非线性FiLM-FNO，4层、64通道，Fourier时间编码，条件场调制，SiLU→FiLM→GroupNorm。
+- 默认采用直接拼接：`flow_model.direct_conditioning=true`在保留FiLM条件场的同时，将LF与高度特征直接送入非线性主干。两套接口及用法见[直接拼接接口](docs/direct-conditioning.md)。
 - 旧模型：`lf_operator/legacy_residual_flow.py`。单主干FiLM-FNO，默认3层、32通道，全局工况与时间调制。保留与旧检查点的参数命名兼容；当前统一训练入口使用新模型。
 - LF基座：`lf_operator/model.py`，2D-to-1D FiLM-FNO。
 - NAGO相关源拟合：`lf_operator/spectral_source.py`。
@@ -31,7 +32,21 @@ python -u run_single_blade.py stage2
 python -u run_single_blade.py stage3
 ```
 
-已有第一、二阶段资产时可直接运行stage3。正式配置为GPU、batch_size=256、seed=42；旧stage3结果目录不覆盖，新速度场写入`stage3_filmfno_v2`。没有断点续训接口，已有输出目录拒绝覆盖。
+已有第一、二阶段资产时可直接运行stage3。默认配置为GPU、batch_size=256、seed=42、modes=12，直接拼接开启，固定学习率1e-3、AdamW权重衰减1e-3，最多2000轮、早停耐心90。默认work为`artifacts/single_blade_parameters_lhs_seed42`，LF基座保留几何分组训练，HF采用LHS引导划分。输出目录由`flow_output`指定；没有断点续训接口，已有目录拒绝覆盖，另开实验需设置新目录名。
+
+ODE求解器由配置中的`ode_method`指定，当前为`dopri5`，`ode_atol=ode_rtol=1e-5`。`ode_steps`只控制固定步长方法，dopri5自行选择步长。容差作用于标准化残差。ODE设置用于验证与预测，不改变流匹配速度回归损失。可用`python scripts/evaluate_flow_solver.py --method dopri5`对已有模型重新评估；它固定检查点的随机种子与采样数，写入独立子目录，不更新权重。
+
+学习率调度对照使用`configs/single_blade_film_concat_e2000_explr099.json`：
+
+```console
+python -u run_single_blade.py stage3 --config configs/single_blade_film_concat_e2000_explr099.json
+```
+
+该配置保留直接拼接、modes=12和最大2000轮，使用AdamW，`flow_weight_decay=1e-4`、`flow_lr_gamma=0.99`。ExponentialLR在每轮全部更新结束后调用一次；第e轮实际学习率为`flow_lr * gamma**(e-1)`。日志记录本轮和下一轮学习率，最优检查点同时保存优化器与调度器状态；当前入口仍不支持断点续训。历史配置若未指定这两个字段，保持原来的固定学习率和`weight_decay=0.001`。新结果使用独立目录。
+
+HF划分配置为`configs/single_blade_film_concat_lhs_e2000.json`，与当前默认配置一致。该实验复用既有LF基座和49份参数缓存，在独立work目录运行`stage2`再运行`stage3`，不改变LF训练划分。`hf_split.method=latin_hypercube`在风速、TSR、弦长和厚度比上为各子集生成独立LHS目标，再用全局唯一匹配分配已有样本；这是离散数据的近似LHS覆盖，不保证观测样本精确满足分层。当前49条划分35/7/7；允许集合间几何重叠，保持样本互斥，评估范围与几何留出实验不同。训练折归一化和源拟合重新计算，NAGO/kFFM算法不变；`stage2/split_design.json`保存设计和匹配结果。代码在未指定hf_split时仍按geometry处理，以兼容历史配置。
+
+第一阶段也采用LHS的对照配置为`configs/single_blade_all_lhs_e2000.json`：在独立work按`stage1`、`stage2`、`stage3`顺序运行。`lf_split.method=latin_hypercube`使用9580条LF的四维输入划分，不按几何分组；大型集合通过稀疏候选图最小代价唯一匹配分配样本，设计和实际匹配求解信息保存在`stage1/split_design.json`。原始标签/缓存不变，第一阶段重新初始化训练，后续LF基线和隐特征重新推理，源与残差缩放重新拟合。HF仍使用同一35/7/7划分，可在同一HF测试集上比较改变LF基座的影响。非几何划分允许相同几何跨集合，不能据此声称未见几何泛化。
 
 ## 参数与网格预测
 

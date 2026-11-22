@@ -46,7 +46,7 @@ def sample_multichannel_source(spec,count,rng):
     return np.concatenate([sample_source(channel,count,rng=rng) for channel in spec['channels']],axis=-1).astype('float32')
 
 
-def validate_flow_assets(arrays,splits,stats,source):
+def validate_flow_assets(arrays,splits,stats,source,split_method='geometry'):
     sets=[set(splits[k]) for k in ('train','val','test')]
     n=len(arrays['case_ids'])
     if len(set(arrays['case_ids'].tolist()))!=n or any(not s for s in sets) or set.union(*sets)!=set(range(n)):
@@ -54,7 +54,11 @@ def validate_flow_assets(arrays,splits,stats,source):
     if any(sets[i]&sets[j] for i in range(3) for j in range(i+1,3)):
         raise ValueError('overlapping HF splits')
     geometry=[set(arrays['geometry_ids'][splits[k]].tolist()) for k in ('train','val','test')]
-    if any(geometry[i]&geometry[j] for i in range(3) for j in range(i+1,3)):
+    if split_method not in ('geometry','latin_hypercube'):
+        raise ValueError('unknown HF split method')
+    if source.get('split_method','geometry')!=split_method:
+        raise ValueError('source and requested HF split policies differ')
+    if split_method=='geometry' and any(geometry[i]&geometry[j] for i in range(3) for j in range(i+1,3)):
         raise ValueError('HF geometry leakage')
     if stats['targets']!=TARGETS or source['targets']!=TARGETS or source['target_contract']!=TARGET_CONTRACT or source.get('input_contract')!=INPUT_CONTRACT or len(source['channels'])!=3:
         raise ValueError('target/source contract mismatch')
@@ -223,12 +227,24 @@ def train_lf(cfg,epochs=None):
     from .training_data import loader,to_device,forward
     device=setup(cfg); work=ROOT/cfg['work']; cache=work/'lf_cache'; out=work/'stage1'
     if out.exists() and any(out.iterdir()):raise FileExistsError(out)
-    manifest=read_json(cache/'manifest.json'); splits=group_split(manifest['records'],seed=cfg['seed'])
+    manifest=read_json(cache/'manifest.json')
     validate_parameter_contract(manifest)
     if manifest.get('target_contract')!=TARGET_CONTRACT:raise ValueError('LF target contract mismatch')
     for record in manifest['records']:
         if digest(cache/record['file'])!=record['cache_hash']:raise ValueError('LF cache hash mismatch')
+    split_cfg=cfg.get('lf_split',{});split_method=split_cfg.get('method','geometry')
+    if split_method=='geometry':
+        splits=group_split(manifest['records'],seed=cfg['seed'])
+        split_report=dict(method=split_method,seed=cfg['seed'])
+    elif split_method=='latin_hypercube':
+        from .splitting import case_parameter_inputs,latin_hypercube_split
+        parameters=case_parameter_inputs(cache,manifest['records'])
+        splits,split_report=latin_hypercube_split(parameters,seed=cfg['seed'],
+            val_fraction=split_cfg.get('val_fraction',.15),test_fraction=split_cfg.get('test_fraction',.15))
+        split_report['dimensions']=['wind_ref_m_s','tsr_ref','chord_m','thickness_ratio']
+    else:raise ValueError('unknown LF split method')
     stats=lf_statistics(cache,manifest,splits['train']); out.mkdir(exist_ok=True)
+    save_json(out/'splits.json',splits);save_json(out/'split_design.json',split_report)
     model_cfg=dict(cfg['lf_model'],n_features=2,n_conditions=2,n_outputs=3)
     model=FiLMFNO(**model_cfg).to(device)
     optim=torch.optim.AdamW(model.parameters(),lr=cfg['lf_lr'],weight_decay=.0001)
@@ -274,12 +290,24 @@ def prepare_residuals(cfg):
     if not np.allclose(arrays['theta'],hf['theta'],atol=1e-6,rtol=0):raise ValueError('HF/LF phase mismatch')
     arrays.update(target=hf['target'],geometry_ids=hf['geometry_ids'])
     records=[dict(case_id=str(i),geometry_id=str(g)) for i,g in zip(hf['case_ids'],hf['geometry_ids'])]
-    splits=group_split(records,seed=cfg['seed'])
+    split_cfg=cfg.get('hf_split',{});split_method=split_cfg.get('method','geometry')
+    split_report=dict(method=split_method,seed=cfg['seed'])
+    if split_method=='geometry':
+        splits=group_split(records,seed=cfg['seed'])
+    elif split_method=='latin_hypercube':
+        from .splitting import latin_hypercube_split
+        from .splitting import case_parameter_inputs
+        parameters=case_parameter_inputs(cache,[manifest['records'][lookup[case]] for case in hf['case_ids']])
+        splits,split_report=latin_hypercube_split(parameters,seed=cfg['seed'],
+            val_fraction=split_cfg.get('val_fraction',.15),test_fraction=split_cfg.get('test_fraction',.15))
+        split_report['dimensions']=['wind_ref_m_s','tsr_ref','chord_m','thickness_ratio']
+    else:raise ValueError('unknown HF split method')
     arrays['residual']=arrays['target']-arrays['lf_prediction']
     stats=residual_normalization(arrays['residual'],splits['train'])
     encoded=encode_residual(arrays['residual'],stats)
     out.mkdir(); np.savez_compressed(out/'paired_data.npz',**arrays)
     save_json(out/'normalization.json',stats); save_json(out/'splits.json',splits)
+    save_json(out/'split_design.json',split_report)
     channels=[]; failures={}
     for j,name in enumerate(TARGETS):
         try:channels.append(fit_source(encoded[splits['train'],:,j:j+1],seed=cfg['seed'],**cfg.get('source_fit',{})))
@@ -287,15 +315,17 @@ def prepare_residuals(cfg):
     if failures:
         save_json(out/'status.json',dict(status='source_infeasible',failures=failures,targets=TARGETS))
         raise ValueError(f'No admissible source for new targets: {failures}')
-    save_json(out/'source.json',dict(channels=channels,targets=TARGETS,target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT,fit_indices=splits['train'],cross_channel_covariance='independent source channels; joint OT'))
-    inputs=[work/'stage1'/'best.pt',cache/'manifest.json',work/'hf_data.npz',work/'hf_provenance.json']+[out/n for n in ('paired_data.npz','splits.json','normalization.json','source.json')]
+    save_json(out/'source.json',dict(channels=channels,targets=TARGETS,target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT,fit_indices=splits['train'],split_method=split_method,cross_channel_covariance='independent source channels; joint OT'))
+    inputs=[work/'stage1'/'best.pt',cache/'manifest.json',work/'hf_data.npz',work/'hf_provenance.json']+[out/n for n in ('paired_data.npz','splits.json','normalization.json','source.json','split_design.json')]
     save_json(out/'provenance.json',{str(p.resolve()):digest(p) for p in inputs})
     lf_train_geometry={manifest['records'][i]['geometry_id'] for i in checkpoint['splits']['train']}
     overlap={k:sorted(set(arrays['geometry_ids'][splits[k]].tolist())&lf_train_geometry) for k in ('val','test')}
     report=dict(status='complete',targets=TARGETS,splits={k:len(v) for k,v in splits.items()},
                 beta=[s['beta'] for s in channels],nu=[s['nu'] for s in channels],old_cp_cq_assets_used=False,
                 lf_pretraining_seen_hf_holdout_geometries=overlap,
-                evaluation_scope='HF labels held out; LF may include the same geometries')
+                split_method=split_method,
+                evaluation_scope=('HF labels held out; LF may include the same geometries' if split_method=='geometry'
+                                  else 'HF cases held out; geometry overlap allowed; approximate LHS input coverage'))
     save_json(out/'status.json',report); print(json.dumps(report),flush=True); return report
 
 
@@ -311,8 +341,13 @@ def paired_batch(arrays,splits,stats,source,count,rng,pairing):
     return indices,(1-t)*g0+t*target,t,target-g0,coupled['diagnostics']
 
 
+def ode_options(cfg):
+    return dict(method=cfg.get('ode_method','heun'),atol=cfg.get('ode_atol',1e-5),rtol=cfg.get('ode_rtol',1e-5))
+
+
 @torch.no_grad()
-def draw_predictions(model,tensors,arrays,indices,source,stats,count,steps,seed,reference_theta=None):
+def draw_predictions(model,tensors,arrays,indices,source,stats,count,steps,seed,reference_theta=None,
+                     method='heun',atol=1e-5,rtol=1e-5,solver_stats=None):
     from .conditioning import prepare_condition
     from .residual_flow import integrate_velocity
     condition=prepare_condition(model,tensors,indices)
@@ -329,7 +364,8 @@ def draw_predictions(model,tensors,arrays,indices,source,stats,count,steps,seed,
                            for channel in source['channels']],axis=-1).astype('float32')
         prediction_stats=dict(stats,mean_profile=evaluate_periodic_profile(
             np.asarray(stats['mean_profile']),reference_theta,arrays['theta']))
-    encoded=integrate_velocity(model,torch.as_tensor(g0,device=next(model.parameters()).device),condition,steps=steps)
+    encoded=integrate_velocity(model,torch.as_tensor(g0,device=next(model.parameters()).device),condition,
+                               steps=steps,method=method,atol=atol,rtol=rtol,diagnostics=solver_stats)
     residual=decode_residual(encoded.cpu().numpy().reshape(len(indices),count,len(arrays['theta']),3),prediction_stats)
     samples=arrays['lf_prediction'][indices,None]+residual
     if not np.isfinite(samples).all():raise FloatingPointError('nonfinite flow samples')
@@ -351,6 +387,38 @@ def validate_velocity_checkpoint(checkpoint):
         raise ValueError('Velocity architecture changed; retrain stage3 with FiLM-FNO. Existing stage1/stage2 assets can be reused.')
 
 
+class FlowEarlyStopping:
+    """Track significant validation improvement; patience is measured in epochs."""
+    def __init__(self,patience,min_delta=0.):
+        if isinstance(patience,bool) or not isinstance(patience,int) or patience<1:
+            raise ValueError('flow patience must be a positive integer')
+        if not np.isfinite(min_delta) or min_delta<0:
+            raise ValueError('flow minimum improvement must be finite and nonnegative')
+        self.patience=patience; self.min_delta=float(min_delta)
+        self.reference=float('inf'); self.last_improvement=None
+
+    def observe(self,epoch,score):
+        if not np.isfinite(score):raise FloatingPointError('nonfinite validation score')
+        if score<self.reference-self.min_delta:
+            self.reference=score; self.last_improvement=epoch
+
+    def should_stop(self,epoch):
+        return self.last_improvement is not None and epoch-self.last_improvement>=self.patience
+
+
+def flow_optimization(parameters,cfg):
+    """Keep historical configs reproducible; new runs opt into epoch decay."""
+    lr=cfg['flow_lr']; decay=cfg.get('flow_weight_decay',.001); gamma=cfg.get('flow_lr_gamma',1.)
+    for name,value in [('flow_lr',lr),('flow_weight_decay',decay),('flow_lr_gamma',gamma)]:
+        if isinstance(value,bool) or not isinstance(value,(int,float)) or not np.isfinite(value):
+            raise ValueError(f'{name} must be a finite number')
+    if lr<=0 or decay<0 or not 0<gamma<=1:
+        raise ValueError('flow_lr must be positive, weight decay nonnegative and gamma in (0,1]')
+    optimizer=torch.optim.AdamW(parameters,lr=lr,weight_decay=decay)
+    scheduler=torch.optim.lr_scheduler.ExponentialLR(optimizer,gamma=gamma)
+    return optimizer,scheduler
+
+
 def train_flow(cfg,epochs=None):
     from .conditioning import fit_condition_scalers,standardize_conditions,tensor_conditions,prepare_condition
     from .residual_flow import ConditionalVelocity
@@ -362,14 +430,15 @@ def train_flow(cfg,epochs=None):
     if not all(digest(Path(p))==h for p,h in provenance.items()):raise ValueError('frozen stage-two inputs changed')
     with np.load(assets/'paired_data.npz') as d:arrays={k:d[k] for k in d.files}
     splits=read_json(assets/'splits.json'); stats=read_json(assets/'normalization.json'); source=read_json(assets/'source.json')
-    validate_flow_assets(arrays,splits,stats,source)
+    validate_flow_assets(arrays,splits,stats,source,split_method=cfg.get('hf_split',{}).get('method','geometry'))
     scalers=fit_condition_scalers(arrays,splits['train'])
     tensors=tensor_conditions(standardize_conditions(arrays,scalers),arrays,device)
     model=ConditionalVelocity(**cfg['flow_model'],n_targets=3,lf_channels=3,n_conditions=2).to(device)
-    optim=torch.optim.AdamW(model.parameters(),lr=cfg['flow_lr'],weight_decay=.001)
+    optim,scheduler=flow_optimization(model.parameters(),cfg)
+    stopping=FlowEarlyStopping(cfg['flow_patience'],cfg.get('flow_min_delta',0.))
     rng=np.random.default_rng(cfg['seed']); out.mkdir(); history=[]; best=float('inf'); best_epoch=0
     for epoch in range(1,(epochs or cfg['flow_epochs'])+1):
-        model.train(); losses=[]; errors=[]
+        model.train(); losses=[]; errors=[]; learning_rate=optim.param_groups[0]['lr']
         for _ in range(cfg['updates_per_epoch']):
             ids,xt,t,u,diagnostics=paired_batch(arrays,splits,stats,source,cfg['batch_size'],rng,cfg['pairing'])
             unique,inverse=np.unique(ids,return_inverse=True)
@@ -379,22 +448,26 @@ def train_flow(cfg,epochs=None):
             if not torch.isfinite(loss):raise FloatingPointError('nonfinite velocity loss')
             loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True); optim.step()
             losses.append(float(loss.detach())); errors.append(diagnostics['marginal_error'])
-        row=dict(epoch=epoch,velocity_mse=float(np.mean(losses)),sinkhorn_marginal_error=max(errors))
+        scheduler.step()
+        row=dict(epoch=epoch,velocity_mse=float(np.mean(losses)),sinkhorn_marginal_error=max(errors),
+                 learning_rate=learning_rate,next_learning_rate=optim.param_groups[0]['lr'])
         if epoch==1 or epoch%cfg['validate_every']==0 or epoch==(epochs or cfg['flow_epochs']):
-            model.eval(); result=draw_predictions(model,tensors,arrays,splits['val'],source,stats,cfg['validation_draws'],cfg['ode_steps'],cfg['seed']+10000)
+            model.eval(); result=draw_predictions(model,tensors,arrays,splits['val'],source,stats,cfg['validation_draws'],cfg['ode_steps'],cfg['seed']+10000,**ode_options(cfg))
             score=float(np.mean(((result['mean']-arrays['target'][splits['val']])/np.array(stats['scale']))**2))
             row['val_standardized_curve_mse']=score
+            stopping.observe(epoch,score)
             if score<best:
                 best=score; best_epoch=epoch
                 torch.save(dict(model=model.state_dict(),model_config=model.config,scalers=scalers,source=source,residual_stats=stats,
+                                optimizer=optim.state_dict(),scheduler=scheduler.state_dict(),
                                 config=cfg,targets=TARGETS,theta=arrays['theta'].tolist(),epoch=epoch,splits=splits,
                                 lf_checkpoint_sha256=digest(work/'stage1'/'best.pt'),target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT),out/'best.pt')
         history.append(row); save_json(out/'history.json',history); print(json.dumps(row),flush=True)
-        if epoch-best_epoch>=cfg['flow_patience']:break
+        if stopping.should_stop(epoch):break
     checkpoint=torch.load(out/'best.pt',map_location=device,weights_only=False); model.load_state_dict(checkpoint['model']); model.eval()
     report={}
     for split in ('val','test'):
-        ids=splits[split]; result=draw_predictions(model,tensors,arrays,ids,source,stats,cfg['evaluation_draws'],cfg['ode_steps'],cfg['seed']+(20000 if split=='test' else 10000))
+        ids=splits[split]; result=draw_predictions(model,tensors,arrays,ids,source,stats,cfg['evaluation_draws'],cfg['ode_steps'],cfg['seed']+(20000 if split=='test' else 10000),**ode_options(cfg))
         mean_baseline=arrays['lf_prediction'][ids]+np.asarray(stats['mean_profile'])
         report[split]=dict(corrected=metrics(result['mean'],arrays['target'][ids]),lf=metrics(arrays['lf_prediction'][ids],arrays['target'][ids]),
                            train_mean=metrics(mean_baseline,arrays['target'][ids]))
@@ -423,7 +496,7 @@ def predict(cfg,cases,output,parameters=None,lf_only=False,n_theta=None):
     if ck.get('input_contract')!=INPUT_CONTRACT or ck['targets']!=TARGETS or ck['target_contract']!=TARGET_CONTRACT or digest(work/'stage1'/'best.pt')!=ck['lf_checkpoint_sha256']:raise ValueError('input/target or LF checkpoint mismatch')
     model=ConditionalVelocity(**ck['model_config']).to(device).eval(); model.load_state_dict(ck['model'])
     tensors=tensor_conditions(standardize_conditions(arrays,ck['scalers']),arrays,device)
-    result=draw_predictions(model,tensors,arrays,np.arange(len(arrays['case_ids'])),ck['source'],ck['residual_stats'],cfg['evaluation_draws'],cfg['ode_steps'],cfg['seed'],reference_theta=np.asarray(ck['theta']))
+    result=draw_predictions(model,tensors,arrays,np.arange(len(arrays['case_ids'])),ck['source'],ck['residual_stats'],cfg['evaluation_draws'],cfg['ode_steps'],cfg['seed'],reference_theta=np.asarray(ck['theta']),**ode_options(cfg))
     out.parent.mkdir(parents=True,exist_ok=True)
     from .resolution import SOURCE_SCOPE
     np.savez_compressed(out,**result,theta=arrays['theta'],case_ids=arrays['case_ids'],targets=np.array(TARGETS),input_contract=np.array(INPUT_CONTRACT),

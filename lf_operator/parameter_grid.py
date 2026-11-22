@@ -101,7 +101,7 @@ def predict_grid(cfg, spec, output, n_theta=None, lf_only=False, query_batch_siz
             tensors = tensor_conditions(standardize_conditions(arrays, checkpoint['scalers']), arrays, device)
             result = pipeline.draw_predictions(model, tensors, arrays, np.arange(end-offset),
                 checkpoint['source'], checkpoint['residual_stats'], cfg['evaluation_draws'],
-                cfg['ode_steps'], cfg['seed'] + offset, reference_theta=np.asarray(checkpoint['theta']))
+                cfg['ode_steps'], cfg['seed'] + offset, reference_theta=np.asarray(checkpoint['theta']),**pipeline.ode_options(cfg))
             for key in keys:
                 summaries[key][offset:end] = result[key]
             # Release draws and chunk features before constructing the next chunk.

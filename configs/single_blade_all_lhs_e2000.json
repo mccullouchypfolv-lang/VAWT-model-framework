@@ -1,0 +1,72 @@
+{
+  "hf_root": "../仿真/High-fidelity/num49/results_origin_detailed/results_origin_detailed",
+  "lf_source": "../仿真/dataset/outputs/results_PC_momentum_c1",
+  "lf_inputs": "../仿真/dataset/outputs/seed1492_n1000_inputs/cases.csv",
+  "work": "artifacts/single_blade_all_lhs_seed42",
+  "device": "cuda",
+  "seed": 42,
+  "batch_size": 256,
+  "workers": 8,
+  "lf_epochs": 100,
+  "lf_lr": 0.001,
+  "lf_patience": 15,
+  "lf_model": {
+    "width": 32,
+    "blocks": 4,
+    "modes_z": 6,
+    "modes_theta": 12,
+    "pad_z": 6
+  },
+  "source_fit": {
+    "tail_band": [
+      12,
+      60
+    ],
+    "resolved_modes": 40,
+    "bin_width": 3,
+    "bootstrap": 200
+  },
+  "flow_epochs": 2000,
+  "flow_lr": 0.001,
+  "updates_per_epoch": 1,
+  "flow_patience": 90,
+  "flow_min_delta": 0.0001,
+  "validate_every": 5,
+  "validation_draws": 8,
+  "evaluation_draws": 32,
+  "ode_steps": 16,
+  "ode_method": "dopri5",
+  "ode_atol": 1e-05,
+  "ode_rtol": 1e-05,
+  "flow_model": {
+    "width": 64,
+    "blocks": 4,
+    "modes": 12,
+    "height_width": 8,
+    "lift_ratio": 4,
+    "projection_ratio": 4,
+    "time_embedding_dim": 32,
+    "architecture": "floral-filmfno-v1",
+    "direct_conditioning": true
+  },
+  "pairing": {
+    "kernel": "sobolev_rbf",
+    "epsilon": 0.02,
+    "derivative_weight": 0.01,
+    "max_iter": 5000,
+    "tol": 1e-06
+  },
+  "flow_output": "stage3_film_concat_dopri5_e2000",
+  "flow_weight_decay": 0.001,
+  "flow_lr_gamma": 1.0,
+  "hf_split": {
+    "method": "latin_hypercube",
+    "val_fraction": 0.15,
+    "test_fraction": 0.15
+  },
+  "lf_split": {
+    "method": "latin_hypercube",
+    "val_fraction": 0.15,
+    "test_fraction": 0.15
+  }
+}

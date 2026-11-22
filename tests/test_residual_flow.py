@@ -170,6 +170,22 @@ class ResidualFlowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             integrate_velocity(lambda g, t, c: g, torch.ones(1, 2, 1), None, method='rk4')
 
+    def test_dopri5_accuracy_gradients_and_adaptive_evaluation(self):
+        source=torch.ones(2,8,3,dtype=torch.float64,requires_grad=True)
+        diagnostics={}
+        def velocity(g,t,condition):
+            self.assertEqual(t.shape,(2,))
+            self.assertIs(condition,self)
+            return g
+        result=integrate_velocity(velocity,source,self,method='dopri5',atol=1e-5,rtol=1e-5,diagnostics=diagnostics)
+        torch.testing.assert_close(result,source*math.e,atol=1e-4,rtol=1e-4)
+        result.sum().backward()
+        torch.testing.assert_close(source.grad,torch.full_like(source,math.e),atol=1e-4,rtol=1e-4)
+        self.assertGreater(diagnostics['nfe'],0)
+        for tolerance in [0,-1,float('nan'),float('inf')]:
+            with self.assertRaises(ValueError):
+                integrate_velocity(velocity,source,self,method='dopri5',atol=tolerance)
+
 
 if __name__ == '__main__':
     unittest.main()

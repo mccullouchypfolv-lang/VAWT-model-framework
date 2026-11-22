@@ -73,7 +73,8 @@ class ConditionalVelocity(nn.Module):
     def __init__(self, width=64, blocks=4, modes=12, field_channels=32,
                  rotor_channels=32, height_width=8, n_conditions=2,
                  n_targets=3, lf_channels=3, lift_ratio=4, projection_ratio=4,
-                 time_embedding_dim=32, architecture='floral-filmfno-v1'):
+                 time_embedding_dim=32, architecture='floral-filmfno-v1',
+                 direct_conditioning=False):
         super().__init__()
         self.config = dict(width=width, blocks=blocks, modes=modes,
                            field_channels=field_channels, rotor_channels=rotor_channels,
@@ -88,13 +89,17 @@ class ConditionalVelocity(nn.Module):
             raise ValueError('time_embedding_dim must be even and at least 2')
         if architecture != 'floral-filmfno-v1':
             raise ValueError('unsupported residual velocity architecture')
+        if not isinstance(direct_conditioning,bool):
+            raise ValueError('direct_conditioning must be a boolean')
         self.config['architecture'] = architecture
+        self.config['direct_conditioning'] = direct_conditioning
         self.height_lift = nn.Conv2d(field_channels + 1, height_width, (3, 1))
         n_features = lf_channels + rotor_channels + height_width + 2
         self.condition_encoder = nn.Sequential(nn.Conv1d(n_features + n_conditions, width, 1),
                                                nn.SiLU(), nn.Conv1d(width, width, 1))
         self.time_embedding = FourierTimeEmbedding(time_embedding_dim)
-        self.lift = nn.Sequential(nn.Conv1d(n_targets + time_embedding_dim, width * lift_ratio, 1),
+        lift_channels=n_targets+time_embedding_dim
+        self.lift = nn.Sequential(nn.Conv1d(lift_channels, width * lift_ratio, 1),
                                   nn.SiLU(), nn.Conv1d(width * lift_ratio, width, 1))
         modulation_channels = width + time_embedding_dim
         self.initial_film = film_network(modulation_channels, width)
@@ -105,6 +110,15 @@ class ConditionalVelocity(nn.Module):
                                      for _ in range(blocks)])
         self.head = nn.Sequential(nn.Conv1d(width, width * projection_ratio, 1), nn.SiLU(),
                                    nn.Conv1d(width * projection_ratio, n_targets, 1))
+        if direct_conditioning:
+            # Expand only after initializing all common modules, so equal seeds
+            # preserve their weights and the original state/time lift columns.
+            previous=self.lift[0]
+            expanded=nn.Conv1d(lift_channels+n_features,width*lift_ratio,1)
+            with torch.no_grad():
+                expanded.weight[:,:lift_channels].copy_(previous.weight)
+                expanded.bias.copy_(previous.bias)
+            self.lift[0]=expanded
 
     def prepare_condition(self, lf, rotor, field, a, z, weights, theta):
         if lf.ndim != 3 or lf.shape[-1] != self.config['lf_channels']:
@@ -149,7 +163,8 @@ class ConditionalVelocity(nn.Module):
         raw = g.transpose(1, 2)
         linear = apply_film(self.linear_spectral(raw) + self.linear_pointwise(raw),
                             self.linear_film(modulation))
-        x = apply_film(self.lift(torch.cat((raw, time), dim=1)), self.initial_film(modulation))
+        state_inputs=(raw,time,features) if self.config['direct_conditioning'] else (raw,time)
+        x = apply_film(self.lift(torch.cat(state_inputs, dim=1)), self.initial_film(modulation))
         for block in self.blocks:
             x = block(x, modulation)
         return linear.transpose(1, 2), self.head(x).transpose(1, 2)
@@ -159,16 +174,34 @@ class ConditionalVelocity(nn.Module):
         return linear + nonlinear
 
 
-def integrate_velocity(model, source, condition, steps=16, method='heun'):
+def integrate_velocity(model, source, condition, steps=16, method='heun',
+                       atol=1e-5, rtol=1e-5, diagnostics=None):
     """Integrate v(g,t,condition) over [0,1]; preserve autograd if enabled.
 
     Euler uses ``steps`` evaluations; Heun uses ``2*steps`` evaluations.
-    Inference callers should choose their own ``torch.no_grad`` context.
+    dopri5 selects steps adaptively using atol/rtol; ``steps`` does not set its
+    step size. Tolerances apply to normalized residual state. Inference callers
+    should choose their own ``torch.no_grad`` context.
     """
     if isinstance(steps, bool) or not isinstance(steps, numbers.Integral) or steps < 1:
         raise ValueError('steps must be a positive integer')
-    if method not in ('euler', 'heun'):
-        raise ValueError('method must be euler or heun')
+    if method not in ('euler', 'heun', 'dopri5'):
+        raise ValueError('method must be euler, heun or dopri5')
+    if method == 'dopri5':
+        if any(isinstance(v,bool) or not isinstance(v,numbers.Real) or not math.isfinite(v) or v<=0
+               for v in (atol,rtol)):
+            raise ValueError('atol and rtol must be finite positive tolerances')
+        from torchdiffeq import odeint
+        evaluations=0
+        def velocity(time,state):
+            nonlocal evaluations
+            evaluations+=1
+            time_batch=time.to(device=source.device,dtype=source.dtype).expand(source.shape[0])
+            return model(state,time_batch,condition)
+        result=odeint(velocity,source,source.new_tensor([0.,1.]),method='dopri5',
+                      atol=atol,rtol=rtol,options={'max_num_steps':100000})[-1]
+        if diagnostics is not None:diagnostics.update(method=method,nfe=evaluations,atol=atol,rtol=rtol)
+        return result
     g = source
     dt = 1.0 / steps
     for index in range(steps):
@@ -181,4 +214,5 @@ def integrate_velocity(model, source, condition, steps=16, method='heun'):
             g = g + .5 * dt * (velocity + next_velocity)
         else:
             g = proposal
+    if diagnostics is not None:diagnostics.update(method=method,nfe=steps*(2 if method=='heun' else 1))
     return g
