@@ -16,7 +16,10 @@ TARGETS=['Cl_blade','Cd_blade','CM_blade']
 
 
 def validate_parameter_contract(checkpoint,manifest=None):
-    if checkpoint.get('input_contract')!=INPUT_CONTRACT or checkpoint.get('features')!=list(FEATURES) or checkpoint.get('conditions')!=list(CONDITIONS):
+    compact=checkpoint.get('model_config',{}).get('input_layout')=='scalar-geometry-layer-wind-v1'
+    features=['uninduced_wind_m_s'] if compact else list(FEATURES)
+    conditions=list(CONDITIONS)+list(FEATURES) if compact else list(CONDITIONS)
+    if checkpoint.get('input_contract')!=INPUT_CONTRACT or checkpoint.get('features')!=features or checkpoint.get('conditions')!=conditions:
         raise ValueError('input contract mismatch: old aerodynamic-input models cannot be used')
     if checkpoint.get('targets')!=TARGETS or checkpoint.get('target_contract')!=TARGET_CONTRACT:
         raise ValueError('target contract mismatch')
@@ -171,7 +174,7 @@ def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None,*,return_fi
     model=FiLMFNO(**checkpoint['model_config']).to(device).eval(); model.load_state_dict(checkpoint['model'])
     feature_keys=('rotor_features','field_features') if return_field_features else ('rotor_features',)
     values={k:[] for k in ('lf_prediction',*feature_keys)}
-    for batch in loader(cache,manifest,indices,checkpoint['statistics'],64,require_targets=False):
+    for batch in loader(cache,manifest,indices,checkpoint['statistics'],64,require_targets=False,**({'input_layout':model.config['input_layout']} if model.config.get('input_layout') else {})):
         result=forward(model,to_device(batch,device),features=True)
         prediction=result['prediction']*result['prediction'].new_tensor(checkpoint['statistics']['y_std'])+result['prediction'].new_tensor(checkpoint['statistics']['y_mean'])
         values['lf_prediction'].append(prediction.cpu().numpy())
@@ -213,8 +216,14 @@ def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None,*
     z=(z-cfg['rotor_bottom_height'])/cfg['height']
     if model is None:
         model=FiLMFNO(**checkpoint['model_config']).to(device).eval();model.load_state_dict(checkpoint['model'])
-    data=[torch.as_tensor(v,dtype=torch.float32,device=device) for v in (x,normalized_a,z,theta,weights)]
-    result=model(*data,return_features=True)
+    if model.config.get('input_layout')=='scalar-geometry-layer-wind-v1':
+        from .training_data import compact_lf_inputs,forward
+        compact=[compact_lf_inputs(v['x'],v['a'],v['z'],v['theta'],stats,cfg) for v in inputs]
+        batch={k:torch.as_tensor(np.stack([v[k] for v in compact]),device=device) for k in compact[0]}
+        result=forward(model,batch,features=True)
+    else:
+        data=[torch.as_tensor(v,dtype=torch.float32,device=device) for v in (x,normalized_a,z,theta,weights)]
+        result=model(*data,return_features=True)
     prediction=result['prediction']*result['prediction'].new_tensor(stats['y_std'])+result['prediction'].new_tensor(stats['y_mean'])
     arrays=dict(case_ids=np.array(ids),conditions=a,z=z,weights=weights,theta=theta[0],
                 lf_prediction=prediction.cpu().numpy(),rotor_features=result['rotor_features'].cpu().numpy(),
@@ -247,26 +256,29 @@ def train_lf(cfg,epochs=None):
     stats=lf_statistics(cache,manifest,splits['train']); out.mkdir(exist_ok=True)
     save_json(out/'splits.json',splits);save_json(out/'split_design.json',split_report)
     model_cfg=dict(cfg['lf_model'],n_features=2,n_conditions=2,n_outputs=3)
+    compact=model_cfg.get('input_layout')=='scalar-geometry-layer-wind-v1'
+    if compact:model_cfg.update(n_features=1,n_conditions=4)
+    loader_options={'input_layout':model_cfg['input_layout']} if compact else {}
     model=FiLMFNO(**model_cfg).to(device)
     optim=torch.optim.AdamW(model.parameters(),lr=cfg['lf_lr'],weight_decay=.0001)
     history=[]; best=float('inf'); best_epoch=0
     for epoch in range(1,(epochs or cfg['lf_epochs'])+1):
         model.train(); total=0.; count=0
-        for batch in loader(cache,manifest,splits['train'],stats,cfg['batch_size'],shuffle=True):
+        for batch in loader(cache,manifest,splits['train'],stats,cfg.get('lf_batch_size',cfg['batch_size']),shuffle=True,**loader_options):
             b=to_device(batch,device); optim.zero_grad(set_to_none=True)
             loss=loss_function(forward(model,b),b['y']); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True); optim.step()
             total+=float(loss.detach())*len(b['x']); count+=len(b['x'])
         model.eval(); valid=0.; nv=0
         with torch.no_grad():
-            for batch in loader(cache,manifest,splits['val'],stats,cfg['batch_size']):
+            for batch in loader(cache,manifest,splits['val'],stats,cfg.get('lf_batch_size',cfg['batch_size']),**loader_options):
                 b=to_device(batch,device); valid+=float(loss_function(forward(model,b),b['y']))*len(b['x']); nv+=len(b['x'])
         row=dict(epoch=epoch,train_loss=total/count,val_loss=valid/nv); history.append(row); print(json.dumps(row),flush=True)
         if row['val_loss']<best:
             best=row['val_loss']; best_epoch=epoch
             torch.save(dict(model=model.state_dict(),model_config=model.config,statistics=stats,splits=splits,targets=TARGETS,
                             config=cfg,epoch=epoch,manifest_sha256=digest(cache/'manifest.json'),target_contract=TARGET_CONTRACT,
-                            input_contract=INPUT_CONTRACT,features=list(FEATURES),conditions=list(CONDITIONS),source_config=manifest['config']),out/'best.pt')
+                            input_contract=INPUT_CONTRACT,features=(['uninduced_wind_m_s'] if compact else list(FEATURES)),conditions=(list(CONDITIONS)+list(FEATURES) if compact else list(CONDITIONS)),source_config=manifest['config']),out/'best.pt')
         save_json(out/'history.json',history)
         if epoch-best_epoch>=cfg['lf_patience']:break
     checkpoint=torch.load(out/'best.pt',map_location='cpu',weights_only=False)
@@ -279,11 +291,12 @@ def train_lf(cfg,epochs=None):
 
 
 def prepare_residuals(cfg):
-    if cfg.get('source_design',{}).get('method')=='floral_fixed_matern':
+    fixed_source=cfg.get('source_design',{}).get('method')=='floral_fixed_matern'
+    if fixed_source and (ROOT/cfg['work']/'stage2').exists():
         from .floral_source import prepare_floral_assets
         return prepare_floral_assets(cfg)
     from .spectral_source import fit_source,AdmissibilityError
-    device=setup(cfg); work=ROOT/cfg['work']; out=work/'stage2'
+    device=setup(cfg); work=ROOT/cfg['work']; out=work/(cfg.get('flow_assets','stage2_floral_fixed') if fixed_source else 'stage2')
     if out.exists():raise FileExistsError(out)
     cache=work/'lf_cache'; manifest=read_json(cache/'manifest.json')
     checkpoint=torch.load(work/'stage1'/'best.pt',map_location='cpu',weights_only=False)
@@ -314,22 +327,35 @@ def prepare_residuals(cfg):
     save_json(out/'split_design.json',split_report)
     channels=[]; failures={}
     for j,name in enumerate(TARGETS):
+        if fixed_source:
+            from .floral_source import floral_matern_source
+            options={k:v for k,v in cfg['source_design'].items() if k!='method'}
+            channels.append(floral_matern_source(len(arrays['theta']),**options))
+            continue
         try:channels.append(fit_source(encoded[splits['train'],:,j:j+1],seed=cfg['seed'],**cfg.get('source_fit',{})))
         except (AdmissibilityError,ValueError) as exc:failures[name]=str(exc)
     if failures:
         save_json(out/'status.json',dict(status='source_infeasible',failures=failures,targets=TARGETS))
         raise ValueError(f'No admissible source for new targets: {failures}')
-    save_json(out/'source.json',dict(channels=channels,targets=TARGETS,target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT,fit_indices=splits['train'],split_method=split_method,cross_channel_covariance='independent source channels; joint OT'))
+    source=dict(channels=channels,targets=TARGETS,target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT,fit_indices=splits['train'],split_method=split_method,cross_channel_covariance='independent source channels; joint OT')
+    if fixed_source:
+        source.update(source_design='fixed official FLORAL residual prior',nago_spectrum_fit=False,
+            fit_indices_role='data-split binding only; GP parameters fixed without HF fitting',
+            cross_channel_covariance='independent draws from the same fixed GP')
+    validate_flow_assets(arrays,splits,stats,source,split_method=split_method)
+    save_json(out/'source.json',source)
+    if fixed_source:save_json(out/'source_design.json',dict(cfg['source_design'],new_lf_residuals=True))
     inputs=[work/'stage1'/'best.pt',cache/'manifest.json',work/'hf_data.npz',work/'hf_provenance.json']+[out/n for n in ('paired_data.npz','splits.json','normalization.json','source.json','split_design.json')]
     save_json(out/'provenance.json',{str(p.resolve()):digest(p) for p in inputs})
     lf_train_geometry={manifest['records'][i]['geometry_id'] for i in checkpoint['splits']['train']}
     overlap={k:sorted(set(arrays['geometry_ids'][splits[k]].tolist())&lf_train_geometry) for k in ('val','test')}
     report=dict(status='complete',targets=TARGETS,splits={k:len(v) for k,v in splits.items()},
-                beta=[s['beta'] for s in channels],nu=[s['nu'] for s in channels],old_cp_cq_assets_used=False,
+                beta=[s.get('beta') for s in channels],nu=[s['nu'] for s in channels],old_cp_cq_assets_used=False,
                 lf_pretraining_seen_hf_holdout_geometries=overlap,
                 split_method=split_method,
                 evaluation_scope=('HF labels held out; LF may include the same geometries' if split_method=='geometry'
                                   else 'HF cases held out; geometry overlap allowed; approximate LHS input coverage'))
+    if fixed_source:report.update(source_design='floral_fixed_matern',nago_spectrum_fit=False)
     save_json(out/'status.json',report); print(json.dumps(report),flush=True); return report
 
 

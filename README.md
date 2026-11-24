@@ -63,3 +63,9 @@ python run_single_blade.py predict-grid --parameters configs/single_blade_grid64
 联合网格输出按风速×TSR×方位角×通道排列；示例形状为`[64,64,64,3]`。`predict-grid-lf`仅计算LF基座。`--query-batch-size`只控制网格推理的工况分块，不改变训练batch。联合网格入口已编写，尚未完成运行验证。
 
 源与残差均值在新方位角网格上按原有Fourier系数求值，保留训练已解析的源带宽；不修改训练标签或对最终预测曲线进行插值放大。模型仍固定20个高度层。预测新工况、加密参数坐标和提高方位角分辨率均需与对应真值评估精度；生成离散度尚未校准。
+
+## 当前选定的第一阶段模型
+
+用户单独选定的新LF模型记录在 `configs/selected_lf_model.json`，配置为 `configs/single_blade_lf_scalar_geometry_layer_wind.json`。使用[U_ref,TSR,chord,thickness_ratio]四标量拼接[B,4]进行块内FiLM调制；20层未诱导来流[B,20]与sin/cos角坐标进入2D FNO，不输入高度或积分权重，沿高度平均。固定风切变alpha=0.2，数据准备时按实际高度计算来流。实际98轮、最佳83轮，LF测试RMSE为Cl 0.056908、Cd 0.003955、CM 0.000258。
+
+本次提交保存的是上述已训练版本。四标量独立分支、块后FiLM和GridEmbeddingND属于后续未训练实验，不属于该选定LF模型。原完整HF默认模型仍由 `configs/selected_model.json` 定义并使用自身冻结的旧LF；不得把新LF直接与旧FM权重混用。新LF对应的残差重建和FM训练在独立目录进行。权重与数据不上传。

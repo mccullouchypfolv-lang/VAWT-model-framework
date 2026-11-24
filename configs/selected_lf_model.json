@@ -1,0 +1,53 @@
+{
+  "selected_by_user": true,
+  "version": "lf-scalar-geometry-layer-wind-v1",
+  "stage": 1,
+  "config": "configs/single_blade_lf_scalar_geometry_layer_wind.json",
+  "checkpoint": "artifacts/single_blade_scalar_geometry_layer_wind_v1/stage1/best.pt",
+  "checkpoint_sha256": "f36a925a1ac74053b5d7b2a16c6dafacf62d66557022f419367c3550e397cb13",
+  "model_config": {
+    "n_features": 1,
+    "n_conditions": 4,
+    "width": 32,
+    "blocks": 4,
+    "modes_z": 6,
+    "modes_theta": 12,
+    "pad_z": 6,
+    "n_outputs": 3,
+    "input_layout": "scalar-geometry-layer-wind-v1"
+  },
+  "best_epoch": 83,
+  "epochs_run": 98,
+  "lf_batch_size": 256,
+  "inputs": {
+    "global_conditions": [
+      "wind_ref_m_s",
+      "tsr_ref",
+      "chord_m",
+      "thickness_ratio"
+    ],
+    "global_shape": "[B,4]",
+    "uninduced_layer_wind": "[B,20]",
+    "angular_coordinates": [
+      "sin(theta)",
+      "cos(theta)"
+    ],
+    "height_input": false,
+    "integration_weights_input": false
+  },
+  "test_metrics": {
+    "Cl_blade": {
+      "rmse": 0.05690772458910942,
+      "mae": 0.04367129132151604
+    },
+    "Cd_blade": {
+      "rmse": 0.00395522266626358,
+      "mae": 0.0021378332749009132
+    },
+    "CM_blade": {
+      "rmse": 0.0002580412838142365,
+      "mae": 0.0001833659189287573
+    }
+  },
+  "scope": "Selected LF model only; selected_model.json continues to identify the previously validated HF model, using its own frozen LF checkpoint"
+}

@@ -61,7 +61,7 @@ class FiLMBlock(nn.Module):
 
 class FiLMFNO(nn.Module):
     def __init__(self,n_features=2,n_conditions=2,width=32,blocks=4,
-                 modes_z=6,modes_theta=12,pad_z=6,n_outputs=3):
+                 modes_z=6,modes_theta=12,pad_z=6,n_outputs=3,input_layout=None):
         super().__init__()
         if isinstance(n_outputs, bool) or not isinstance(n_outputs, numbers.Integral) or n_outputs < 1:
             raise ValueError('n_outputs must be a positive integer')
@@ -70,26 +70,37 @@ class FiLMFNO(nn.Module):
         self.config = dict(n_features=n_features,n_conditions=n_conditions,width=width,
                            blocks=blocks,modes_z=modes_z,modes_theta=modes_theta,pad_z=pad_z,
                            n_outputs=n_outputs)
-        self.lift = nn.Conv2d(n_features+3,width,1)
+        if input_layout is not None:
+            if input_layout!='scalar-geometry-layer-wind-v1' or (n_features,n_conditions)!=(1,4):
+                raise ValueError('compact LF requires one wind field and four scalar conditions')
+            self.config['input_layout']=input_layout
+        self.lift = nn.Conv2d(n_features+(2 if input_layout else 3),width,1)
         self.blocks = nn.ModuleList([FiLMBlock(width,n_conditions,modes_z,modes_theta,pad_z) for _ in range(blocks)])
         self.head = nn.Sequential(nn.Conv1d(width,width,1),nn.GELU(),nn.Conv1d(width,n_outputs,1))
 
-    def forward(self,x,a,z,theta,weights,return_features=False):
+    def forward(self,x,a,z=None,theta=None,weights=None,return_features=False):
+        compact=self.config.get('input_layout')=='scalar-geometry-layer-wind-v1'
+        if compact:
+            if x.ndim!=2 or x.shape[1]!=20 or weights is not None or z is not None:
+                raise ValueError('compact LF expects [B,20] uninduced wind; no height or weights')
+            x=x[:,:,None,None].expand(-1,-1,1,theta.shape[-1])
         if x.ndim != 4 or x.shape[1] != 20 or x.shape[2] != self.config['n_features']:
             raise ValueError('x must be [B,20,n_features,N_theta]')
         b,nz,_,nt = x.shape
-        if a.shape != (b,self.config['n_conditions']) or z.shape != (b,nz) or theta.shape != (b,nt) or weights.shape != (b,nz):
+        if a.shape != (b,self.config['n_conditions']) or theta.shape != (b,nt) or (not compact and (z is None or z.shape != (b,nz) or weights is None or weights.shape != (b,nz))):
             raise ValueError('condition/coordinate/weight shape mismatch')
-        if not torch.isfinite(weights).all() or (weights<=0).any():
+        if not compact and (not torch.isfinite(weights).all() or (weights<=0).any()):
             raise ValueError('height weights must be finite and positive')
-        coords = torch.stack((z[:,:,None].expand(-1,-1,nt),
-                              theta.sin()[:,None,:].expand(-1,nz,-1),
-                              theta.cos()[:,None,:].expand(-1,nz,-1)),dim=1)
+        periodic=(theta.sin()[:,None,:].expand(-1,nz,-1),theta.cos()[:,None,:].expand(-1,nz,-1))
+        coords = torch.stack(periodic if compact else (z[:,:,None].expand(-1,-1,nt),*periodic),dim=1)
         field = self.lift(torch.cat((x.permute(0,2,1,3),coords),dim=1))
         for block in self.blocks:
             field = block(field,a)
-        weights = weights/weights.sum(-1,keepdim=True)
-        rotor_features = (field*weights[:,None,:,None]).sum(2)
+        if compact:
+            rotor_features=field.mean(2)
+        else:
+            weights = weights/weights.sum(-1,keepdim=True)
+            rotor_features = (field*weights[:,None,:,None]).sum(2)
         prediction = self.head(rotor_features).transpose(1,2)
         if return_features:
             return dict(prediction=prediction,field_features=field,rotor_features=rotor_features)
