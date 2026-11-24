@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from .blade_data import INPUT_CONTRACT, TARGET_CONTRACT, parameter_inputs
-from .resolution import midpoint_theta, SOURCE_SCOPE
+from .resolution import midpoint_theta
 
 
 def _axis(value, name):
@@ -63,7 +63,7 @@ def predict_grid(cfg, spec, output, n_theta=None, lf_only=False, query_batch_siz
     from .conditioning import standardize_conditions, tensor_conditions
     from .data import digest
     from .model import FiLMFNO
-    from .residual_flow import ConditionalVelocity
+    from .residual_flow import create_velocity_model as ConditionalVelocity
 
     if (isinstance(query_batch_size, (bool, np.bool_))
             or not isinstance(query_batch_size, (int, np.integer)) or query_batch_size < 1):
@@ -89,16 +89,17 @@ def predict_grid(cfg, spec, output, n_theta=None, lf_only=False, query_batch_siz
         model = ConditionalVelocity(**checkpoint['model_config']).to(device).eval()
         model.load_state_dict(checkpoint['model'])
     count = len(grid['queries'])
+    rotor_only=not lf_only and checkpoint['model_config'].get('architecture')=='rotor-only-filmfno-v1'
     keys = ('prediction',) if lf_only else ('mean', 'std', 'q05', 'q95')
     summaries = {key: np.empty((count, len(grid['theta']), 3), dtype=np.float32) for key in keys}
     for offset in range(0, count, query_batch_size):
         end = min(offset + query_batch_size, count)
         arrays = pipeline.lf_predict_parameters(lf_checkpoint, grid['queries'][offset:end], device,
-                                                n_theta=len(grid['theta']), model=lf_model)
+                                                n_theta=len(grid['theta']), model=lf_model,return_field_features=not rotor_only)
         if lf_only:
             summaries['prediction'][offset:end] = arrays['lf_prediction']
         else:
-            tensors = tensor_conditions(standardize_conditions(arrays, checkpoint['scalers']), arrays, device)
+            tensors = tensor_conditions(standardize_conditions(arrays, checkpoint['scalers']), arrays, device,include_height=not rotor_only)
             result = pipeline.draw_predictions(model, tensors, arrays, np.arange(end-offset),
                 checkpoint['source'], checkpoint['residual_stats'], cfg['evaluation_draws'],
                 cfg['ode_steps'], cfg['seed'] + offset, reference_theta=np.asarray(checkpoint['theta']),**pipeline.ode_options(cfg))
@@ -112,7 +113,8 @@ def predict_grid(cfg, spec, output, n_theta=None, lf_only=False, query_batch_siz
                     axis_order=np.asarray(['wind_ref_m_s', 'tsr_ref', 'theta', 'target']),
                     shape=np.asarray(grid['shape']))
     if not lf_only:
-        metadata.update(training_theta=np.asarray(checkpoint['theta']), source_scope=np.asarray(SOURCE_SCOPE))
+        from .resolution import source_scope
+        metadata.update(training_theta=np.asarray(checkpoint['theta']), source_scope=np.asarray(source_scope(checkpoint['source'])))
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **{key: values.reshape(grid['shape']) for key, values in summaries.items()}, **metadata)
     return dict(output=str(out.resolve()), shape=list(grid['shape']), conditions=count, n_theta=len(grid['theta']))

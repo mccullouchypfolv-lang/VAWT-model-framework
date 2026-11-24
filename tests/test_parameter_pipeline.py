@@ -56,6 +56,7 @@ class ParameterPipelineTests(unittest.TestCase):
         self.assertEqual(output['conditions'].shape,(1,2))
         self.assertTrue(np.isfinite(output['lf_prediction']).all())
         self.assertEqual(output['field_features'].shape,(1,4,20,160))
+        np.testing.assert_allclose(output['geometry'][0],np.stack((query['chord_m'],query['thickness_ratio']),axis=-1),atol=1e-6)
         self.assertEqual(str(output['case_ids'][0]),'new')
 
     def test_corrected_two_condition_residual_flow_accepts_parameter_derived_features(self):

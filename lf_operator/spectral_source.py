@@ -163,6 +163,9 @@ def fit_source(train_samples, *, tail_band=(12, 60), resolved_modes=40,
 
 def sample_source(spec, count, seed=None, rng=None):
     """Draw zero-mean real periodic fields [count,N,1], without per-draw scaling."""
+    if spec.get('kind')=='floral_fixed_matern_gp':
+        from .floral_source import sample_floral_source
+        return sample_floral_source(spec,count,seed=seed,rng=rng)
     n, psd = _validated_psd(spec)
     count = _positive_integer(count, 'count')
     if seed is not None and rng is not None:

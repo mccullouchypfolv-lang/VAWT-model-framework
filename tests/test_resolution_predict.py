@@ -53,6 +53,16 @@ class ResolutionPredictionTests(unittest.TestCase):
             predict(cfg,None,work/'default.npz',parameters=queries)
             with np.load(work/'default.npz') as default,np.load(work/'prediction_160.npz') as explicit:
                 np.testing.assert_array_equal(default['samples'],explicit['samples'])
+            from lf_operator.floral_source import floral_matern_source
+            ck['source']={'channels':[floral_matern_source(160) for _ in range(3)]}
+            torch.save(ck,work/'stage3/best.pt')
+            for n in (80,160,320):
+                out=work/f'floral_source_prediction_{n}.npz'
+                predict(cfg,None,out,parameters=queries,n_theta=n)
+                with np.load(out) as result:
+                    self.assertEqual(result['samples'].shape,(2,2,n,3))
+                    self.assertTrue(np.isfinite(result['samples']).all())
+                    self.assertIn('fixed FLORAL',str(result['source_scope']))
         finally:
             if not work.resolve().is_relative_to((ROOT/'tmp').resolve()):
                 raise ValueError('test cleanup outside workspace')

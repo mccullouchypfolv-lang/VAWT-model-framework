@@ -4,13 +4,15 @@
 
 本仓库只保存代码、配置与测试，不保存数据集、训练权重、缓存、训练日志、结果图或实验输出。
 
+当前默认由用户选定为 **FLORAL 固定 Matérn 源＋独立耦合＋时间加权＋FiLM 与直接拼接**。配置为 `configs/single_blade.json`，与 `configs/single_blade_hf100_floral_fixed_source.json` 一致；注册表为 `configs/selected_model.json`。实际训练300轮，最佳210轮。旧NAGO版本保留，不作为当前默认。
+
 ## 新旧速度场
 
 - 新模型：`lf_operator/residual_flow.py`。独立线性旁路 + 非线性FiLM-FNO，4层、64通道，Fourier时间编码，条件场调制，SiLU→FiLM→GroupNorm。
 - 默认采用直接拼接：`flow_model.direct_conditioning=true`在保留FiLM条件场的同时，将LF与高度特征直接送入非线性主干。两套接口及用法见[直接拼接接口](docs/direct-conditioning.md)。
 - 旧模型：`lf_operator/legacy_residual_flow.py`。单主干FiLM-FNO，默认3层、32通道，全局工况与时间调制。保留与旧检查点的参数命名兼容；当前统一训练入口使用新模型。
 - LF基座：`lf_operator/model.py`，2D-to-1D FiLM-FNO。
-- NAGO相关源拟合：`lf_operator/spectral_source.py`。
+- 默认源：`lf_operator/floral_source.py`，零均值Matérn GP，nu=0.5，lengthscale=1e-3，outputscale=1，残差模式协方差乘2；坐标theta/(2*pi)，欧氏核。保留NAGO实现 `lf_operator/spectral_source.py` 供旧模型复现。
 - kFFM相关全batch Kernel OT：`lf_operator/kernel_ot.py`。
 
 旧权重在本地可用以下类加载，不需要把权重提交到Git：
@@ -23,6 +25,8 @@ model.load_state_dict(checkpoint['model'])
 
 ## 训练
 
+固定源阶段二复用本地原 `stage2` 中的配对数据、划分、归一化及来源记录，再生成独立固定源资产目录。这些资产不上传GitHub。首次准备时，先用 `configs/single_blade_hf100_modes6_b16_u32.json` 运行prepare、stage1、stage2，再切换默认配置运行stage2、stage3。已有完整固定源资产时直接运行stage3。
+
 先准备本地数据路径：编辑`configs/single_blade.json`。安装`requirements.txt`依赖后，从仓库根目录依次运行：
 
 ```console
@@ -32,7 +36,7 @@ python -u run_single_blade.py stage2
 python -u run_single_blade.py stage3
 ```
 
-已有第一、二阶段资产时可直接运行stage3。当前选定模型记录在`configs/selected_model.json`：FiLM＋直接拼接、modes=12，实际605轮、最优515轮。默认work为`artifacts/single_blade_parameters_v1`，flow_output为`stage3_film_concat_dopri5_e2000`，LF和HF均使用几何分组划分（HF32/9/8）。默认GPU、batch256、seed42、固定lr=1e-3、AdamW权重衰减1e-3、最大2000轮、早停90。已有输出目录拒绝覆盖，新实验需另设flow_output；没有断点续训入口。
+当前默认：100条HF，按几何划分71/14/15；GPU、seed42、batch16、每轮32次更新、modes6、固定学习率1e-3、AdamW权重衰减1e-3、最大2000轮、早停耐心90。训练目标为1+2t²加权FM速度MSE，按验证集ODE曲线MSE选择最佳权重。已有输出目录拒绝覆盖，新实验需另设flow_output。默认源不使用NAGO频谱拟合或kFFM配对。
 
 ODE求解器由配置中的`ode_method`指定，当前为`dopri5`，`ode_atol=ode_rtol=1e-5`。`ode_steps`只控制固定步长方法，dopri5自行选择步长。容差作用于标准化残差。ODE设置用于验证与预测，不改变流匹配速度回归损失。可用`python scripts/evaluate_flow_solver.py --method dopri5`对已有模型重新评估；它固定检查点的随机种子与采样数，写入独立子目录，不更新权重。
 

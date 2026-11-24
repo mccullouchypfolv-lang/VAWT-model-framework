@@ -1,0 +1,26 @@
+{
+  "selected_by_user": true,
+  "version": "hf100-nago-independent-timeweighted-modes6",
+  "architecture": "FiLM-FNO with direct LF/height concatenation; original velocity blocks",
+  "config": "configs/single_blade.json",
+  "explicit_config": "configs/single_blade_hf100_modes6.json",
+  "checkpoint": "artifacts/single_blade_parameters_hf100_v1/stage3_nago_independent_timeweighted_modes6_e2000/best.pt",
+  "checkpoint_sha256": "88d1daabc67d24e9dcbd52db38915863eced6a87504ea8fafcca1ac16bede9f1",
+  "work": "artifacts/single_blade_parameters_hf100_v1",
+  "flow_output": "stage3_nago_independent_timeweighted_modes6_e2000",
+  "modes": 6,
+  "time_embedding_dim": 32,
+  "best_epoch": 145,
+  "epochs_run": 235,
+  "configured_epoch_limit": 2000,
+  "hf_split": "geometry",
+  "hf_split_counts": {
+    "train": 71,
+    "val": 14,
+    "test": 15
+  },
+  "rejected_experiment": {
+    "config": "configs/single_blade_hf100_floral_aligned.json",
+    "reason": "User rejected after comparison; retained for reproducibility"
+  }
+}

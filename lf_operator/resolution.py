@@ -14,6 +14,14 @@ SOURCE_SCOPE = 'training-resolved periodic Matérn process'
 _PERIOD = 2 * np.pi
 
 
+def source_scope(source):
+    channels=source.get('channels',[])
+    if channels and all(c.get('kind')=='floral_fixed_matern_gp' for c in channels):
+        from .floral_source import SCOPE
+        return SCOPE
+    return SOURCE_SCOPE
+
+
 def midpoint_theta(n_theta):
     """Return N ordered cell midpoints on [0, 2*pi), for integer N >= 4."""
     if (isinstance(n_theta, (bool, np.bool_))
@@ -89,6 +97,9 @@ def evaluate_source(spec, count, theta, rng):
     nodes varies with that cosine. It is deliberately never renormalized.
     """
     query = _uniform_theta(theta, 'theta')
+    if spec.get('kind')=='floral_fixed_matern_gp':
+        from .floral_source import sample_floral_source
+        return sample_floral_source(spec,count,theta=query,rng=rng)
     domain = np.asarray(spec.get('domain', [0., _PERIOD]), dtype=float)
     if domain.shape != (2,) or not np.array_equal(domain, [0., _PERIOD]):
         raise ValueError('source domain must be [0, 2*pi]')

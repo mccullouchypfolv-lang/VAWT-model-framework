@@ -11,7 +11,7 @@ import torch
 from lf_operator.blade_pipeline import (ROOT,setup,read_json,save_json,digest,metrics,
     draw_predictions,flow_output_directory,validate_velocity_checkpoint,validate_flow_assets)
 from lf_operator.conditioning import standardize_conditions,tensor_conditions
-from lf_operator.residual_flow import ConditionalVelocity
+from lf_operator.residual_flow import create_velocity_model as ConditionalVelocity
 
 
 def main():
@@ -22,7 +22,7 @@ def main():
     parser.add_argument('--rtol',type=float,default=1e-5)
     parser.add_argument('--output',type=Path)
     args=parser.parse_args();cfg=read_json(args.config);device=setup(cfg)
-    run=flow_output_directory(cfg);assets=ROOT/cfg['work']/'stage2'
+    run=flow_output_directory(cfg);assets=ROOT/cfg['work']/cfg.get('flow_assets','stage2')
     out=args.output or run/f'solver_{args.method}_a{args.atol:g}_r{args.rtol:g}'
     if out.exists():raise FileExistsError(out)
     ck=torch.load(run/'best.pt',map_location='cpu',weights_only=False)
@@ -34,9 +34,13 @@ def main():
     with np.load(assets/'paired_data.npz') as data:arrays={k:data[k] for k in data.files}
     splits=read_json(assets/'splits.json')
     stats=ck['residual_stats'];source=ck['source']
-    validate_flow_assets(arrays,splits,stats,source)
+    validate_flow_assets(arrays,splits,stats,source,split_method=ck['config'].get('hf_split',{}).get('method','geometry'))
     if ck['splits']!=splits:raise ValueError('split differs from frozen checkpoint')
     model=ConditionalVelocity(**ck['model_config']).to(device).eval();model.load_state_dict(ck['model'])
+    if ck['model_config'].get('explicit_physical_conditioning',False) or ck['model_config'].get('scalar_geometry_film',False):
+        from lf_operator.conditioning import geometry_from_cache
+        cache=ROOT/cfg['work']/'lf_cache'
+        arrays=geometry_from_cache(arrays,cache,read_json(cache/'manifest.json'))
     tensors=tensor_conditions(standardize_conditions(arrays,ck['scalers']),arrays,device)
     baseline=read_json(run/'metrics.json')
     if baseline['best_epoch']!=ck['epoch']:raise ValueError('baseline does not describe the selected checkpoint')

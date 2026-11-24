@@ -1,0 +1,9 @@
+# Fixed official FLORAL source ablation
+
+User rejected the LHS split and requests replacing NAGO with FLORAL's source. Return to selected default geometry split71/14/15, original velocity model, normalized targets, independent coupling, quadratic time-weighted MSE and optimization. Preserve every previous checkpoint/asset. Only replace source; do NOT reintroduce aligned-network, bridge-noise, loss or memory-state ablations.
+
+Verified upstream commit9d1c1c0c25a7b367ad24441358660e98b274aa2c: gp/gp.py uses MaternKernel(nu=.5) + ScaleKernel + zero ConstantMean. examples/oneDCorr/config.yml sets lengthscale1e-3/outputscale1. flow/flow.py multiplies covariance by2 in residual mode and explicitly passes confidence0, ignoring config confidence0.6. Thus marginal variance is2, NOT0.001; no residual doubling. Record pinned links in source asset. Likelihood noise is not applied in prior sampling.
+
+Evaluate the ordinary Euclidean exponential kernel on x=theta/(2*pi), native160 midpoint nodes, preserving original data and no interpolation. It is not a periodicized kernel. Exact independent-channel GP draws via the exponential kernel's stationary AR(1) representation, with r=exp(-dx/lengthscale), variance2. At new resolution evaluate the same fixed kernel on new points (not NAGO's bandlimited continuation; seeded paths need not coincide across resolutions). Do not fit or claim NAGO admissibility.
+
+TDD: exact covariance formula and factor2, Euclidean edge behavior, empirical covariance and mean, reproducibility, native/general-grid sampler dispatch, CPU end-to-end train/checkpoint/resolution inference. Run full tests before GPU. Copy baseline paired arrays, splits and residual normalization to isolated stage2 assets; replace source only with explicit fixed-prior metadata; record provenance and hashes. Train max2000/patience90/batch16/update32/lr0.001. Compare same15 test cases and lowTSR4 against selected default.

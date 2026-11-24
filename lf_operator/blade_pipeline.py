@@ -34,10 +34,16 @@ def residual_normalization(values,indices):
 
 
 def encode_residual(values,stats):
+    if 'spectral_whitening' in stats:
+        from .spectral_whitening import whiten
+        return whiten(values,stats)
     return ((values-np.asarray(stats['mean_profile']))/np.asarray(stats['scale'])).astype('float32')
 
 
 def decode_residual(values,stats):
+    if 'spectral_whitening' in stats:
+        from .spectral_whitening import recolor
+        return recolor(values,stats)
     return np.asarray(values)*np.asarray(stats['scale'])+np.asarray(stats['mean_profile'])
 
 
@@ -79,17 +85,17 @@ def setup(cfg):
 
 def prepare(cfg,hf_only=False):
     from .blade_data import read_lf_case,read_hf_case,match_cases,FEATURES
+    from .hf_dataset import collect_hf_folders,build_hf_arrays
     work=ROOT/cfg['work']; cache=work/'lf_cache'
     if (cache/'manifest.json').exists():raise FileExistsError(cache/'manifest.json')
     source=(ROOT/cfg['lf_source']).resolve(); config=read_json(source/'common_config.json')
     completed={r['case_id'] for r in table(source/'progress.csv') if r['status']=='completed'}
     inputs={r['case_id']:r for r in table(ROOT/cfg['lf_inputs'])}
     records=[dict(case_id=i,geometry_id=inputs[i]['geometry_id'],sample_id=inputs[i]['sample_id'],file=f'cases/{i}.npz') for i in sorted(completed)]
-    hf_root=(ROOT/cfg['hf_root']).resolve()
-    folders=sorted(p for p in hf_root.iterdir() if p.is_dir() and p.name.startswith('S'))
+    folders=collect_hf_folders(cfg,ROOT)
     by_id={r['case_id']:r for r in records}
     hf_ids=[p.name for p in folders]
-    if len(folders)!=49 or not set(hf_ids)<=by_id.keys():raise ValueError('expected 49 completed LF/HF pairs')
+    if not set(hf_ids)<=by_id.keys():raise ValueError('HF cases missing completed LF inputs')
     records=[r for r in records if not hf_only or r['case_id'] in set(hf_ids)]
     (cache/'cases').mkdir(parents=True,exist_ok=True)
     def convert(record):
@@ -102,22 +108,12 @@ def prepare(cfg,hf_only=False):
     manifest=dict(schema='single-blade-parameters-v1',input_contract=INPUT_CONTRACT,target_contract=TARGET_CONTRACT,source=str(source),config=config,features=list(FEATURES),
                   conditions=list(CONDITIONS),targets=TARGETS,records=converted,hf_only_smoke=hf_only,
                   input_policy='Only U_ref, TSR and 20-layer chord/thickness; aerodynamic values are labels only')
-    converted_lookup={r['case_id']:r for r in converted}
-    hf,provenance=[],{}
-    for folder in folders:
-        item=read_hf_case(folder,config)
-        with np.load(cache/converted_lookup[folder.name]['file']) as d:
-            lf=dict(case_id=folder.name,conditions=d['a'],theta=d['theta'],reference_conditions=d['reference_conditions'])
-        match_cases(lf,item)
-        hf.append(item); provenance[folder.name]=item['metadata']
-    np.savez_compressed(work/'hf_data.npz',case_ids=np.array(hf_ids),
-                        geometry_ids=np.array([by_id[i]['geometry_id'] for i in hf_ids]),
-                        conditions=np.stack([h['a'] for h in hf]),theta=hf[0]['theta'],
-                        target=np.stack([h['y'] for h in hf]))
+    hf,provenance=build_hf_arrays(folders,cache,manifest)
+    np.savez_compressed(work/'hf_data.npz',**hf)
     save_json(work/'hf_provenance.json',provenance)
     save_json(cache/'manifest.json',manifest)
-    result=dict(status='prepared',lf_cases=len(converted),hf_cases=49,hf_only_smoke=hf_only,targets=TARGETS,input_contract=INPUT_CONTRACT,
-                hf_root=str(hf_root),coefficient_contract='See docs/single-blade-design.md; no old CP/CQ conversion')
+    result=dict(status='prepared',lf_cases=len(converted),hf_cases=len(folders),hf_only_smoke=hf_only,targets=TARGETS,input_contract=INPUT_CONTRACT,
+                hf_roots=sorted({str(p.parent) for p in folders}),coefficient_contract='See docs/single-blade-design.md; no old CP/CQ conversion')
     save_json(work/'preparation.json',result); print(json.dumps(result),flush=True)
     return result
 
@@ -155,7 +151,7 @@ def metrics(prediction,target):
 
 
 @torch.no_grad()
-def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None):
+def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None,*,return_field_features=True):
     from .model import FiLMFNO
     from .training_data import loader,to_device,forward
     validate_parameter_contract(checkpoint,manifest)
@@ -171,26 +167,28 @@ def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None):
                 x,a=data['x'],data['a']
                 queries.append(dict(case_id=record['case_id'],wind_ref_m_s=float(a[0]),tsr_ref=float(a[1]),
                                     chord_m=x[:,0,0],thickness_ratio=x[:,1,0]))
-        return lf_predict_parameters(checkpoint,queries,device,n_theta=n_theta)
+        return lf_predict_parameters(checkpoint,queries,device,n_theta=n_theta,return_field_features=return_field_features)
     model=FiLMFNO(**checkpoint['model_config']).to(device).eval(); model.load_state_dict(checkpoint['model'])
-    values={k:[] for k in ('lf_prediction','rotor_features','field_features')}
+    feature_keys=('rotor_features','field_features') if return_field_features else ('rotor_features',)
+    values={k:[] for k in ('lf_prediction',*feature_keys)}
     for batch in loader(cache,manifest,indices,checkpoint['statistics'],64,require_targets=False):
         result=forward(model,to_device(batch,device),features=True)
         prediction=result['prediction']*result['prediction'].new_tensor(checkpoint['statistics']['y_std'])+result['prediction'].new_tensor(checkpoint['statistics']['y_mean'])
         values['lf_prediction'].append(prediction.cpu().numpy())
-        for k in ('rotor_features','field_features'):values[k].append(result[k].cpu().numpy())
+        for k in feature_keys:values[k].append(result[k].cpu().numpy())
     arrays={k:np.concatenate(v) for k,v in values.items()}
     raw=[]
     for i in indices:
-        with np.load(cache/manifest['records'][i]['file']) as d:raw.append({k:d[k] for k in ('a','z','weights','theta')})
+        with np.load(cache/manifest['records'][i]['file']) as d:raw.append({k:d[k] for k in ('a','z','weights','theta','x')})
     arrays.update(case_ids=np.array([manifest['records'][i]['case_id'] for i in indices]),
                   conditions=np.stack([d['a'] for d in raw]),z=(np.stack([d['z'] for d in raw])-manifest['config']['rotor_bottom_height'])/manifest['config']['height'],
-                  weights=np.stack([d['weights'] for d in raw]),theta=raw[0]['theta'])
+                  weights=np.stack([d['weights'] for d in raw]),theta=raw[0]['theta'],
+                  geometry=np.stack([d['x'][:,:,0] for d in raw]))
     return arrays
 
 
 @torch.no_grad()
-def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None):
+def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None,*,return_field_features=True):
     """Inference from declared variables only. No LF/HF solver outputs are opened."""
     from .model import FiLMFNO
     validate_parameter_contract(checkpoint)
@@ -209,6 +207,7 @@ def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None):
     x=np.stack([v['x'] for v in inputs]).astype('float32'); a=np.stack([v['a'] for v in inputs]).astype('float32')
     z=np.stack([v['z'] for v in inputs]).astype('float32'); weights=np.stack([v['weights'] for v in inputs]).astype('float32')
     theta=np.stack([v['theta'] for v in inputs]).astype('float32')
+    geometry=x[:,:,:,0].copy()
     x=(x-np.asarray(stats['x_mean'],dtype='float32')[None,None,:,None])/np.asarray(stats['x_std'],dtype='float32')[None,None,:,None]
     normalized_a=(a-np.asarray(stats['a_mean'],dtype='float32'))/np.asarray(stats['a_std'],dtype='float32')
     z=(z-cfg['rotor_bottom_height'])/cfg['height']
@@ -217,9 +216,11 @@ def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None):
     data=[torch.as_tensor(v,dtype=torch.float32,device=device) for v in (x,normalized_a,z,theta,weights)]
     result=model(*data,return_features=True)
     prediction=result['prediction']*result['prediction'].new_tensor(stats['y_std'])+result['prediction'].new_tensor(stats['y_mean'])
-    return dict(case_ids=np.array(ids),conditions=a,z=z,weights=weights,theta=theta[0],
+    arrays=dict(case_ids=np.array(ids),conditions=a,z=z,weights=weights,theta=theta[0],
                 lf_prediction=prediction.cpu().numpy(),rotor_features=result['rotor_features'].cpu().numpy(),
-                field_features=result['field_features'].cpu().numpy())
+                geometry=geometry)
+    if return_field_features:arrays['field_features']=result['field_features'].cpu().numpy()
+    return arrays
 
 
 def train_lf(cfg,epochs=None):
@@ -278,6 +279,9 @@ def train_lf(cfg,epochs=None):
 
 
 def prepare_residuals(cfg):
+    if cfg.get('source_design',{}).get('method')=='floral_fixed_matern':
+        from .floral_source import prepare_floral_assets
+        return prepare_floral_assets(cfg)
     from .spectral_source import fit_source,AdmissibilityError
     device=setup(cfg); work=ROOT/cfg['work']; out=work/'stage2'
     if out.exists():raise FileExistsError(out)
@@ -329,16 +333,44 @@ def prepare_residuals(cfg):
     save_json(out/'status.json',report); print(json.dumps(report),flush=True); return report
 
 
-def paired_batch(arrays,splits,stats,source,count,rng,pairing):
-    from .kernel_ot import couple_endpoints
-    indices=rng.choice(splits['train'],count,replace=True)
+def coupling_method(pairing,joint_enabled=False):
+    method=pairing.get('method','kernel_ot')
+    if method not in ('kernel_ot','independent'):raise ValueError('unknown coupling method')
+    if method=='independent' and (set(pairing)!={'method'} or joint_enabled):
+        raise ValueError('independent coupling must not contain kernel options or enable joint source/coupling optimization')
+    return method
+
+
+def paired_batch(arrays,splits,stats,source,count,rng,pairing,joint_pairing=None,*,target_indices=None,bridge=None):
+    method=coupling_method(pairing,joint_enabled=joint_pairing is not None)
+    if target_indices is None:
+        indices=rng.choice(splits['train'],count,replace=True)
+    else:
+        indices=np.asarray(target_indices,dtype=np.int64)
+        if indices.shape!=(count,) or not set(indices.tolist())<=set(splits['train']):raise ValueError('invalid training batch indices')
     g0=sample_multichannel_source(source,count,rng)
     target=encode_residual(arrays['residual'][indices],stats)
-    coupled=couple_endpoints(g0,target,rng=rng,**pairing)
-    i,j=coupled['source_indices'],coupled['target_indices']
-    g0,target,indices=g0[i],target[j],indices[j]
+    if method=='independent':
+        # Source draws are independent of the target/condition draws. No
+        # finite batch transport plan or endpoint-dependent reordering.
+        diagnostics=dict(method='independent',conditional_source_independence_by_construction=True)
+    else:
+        options={k:v for k,v in pairing.items() if k!='method'}
+        if joint_pairing is None:
+            from .kernel_ot import couple_endpoints
+            coupled=couple_endpoints(g0,target,rng=rng,**options)
+        else:
+            from .joint_source_coupling import couple_joint_endpoints
+            coupled=couple_joint_endpoints(g0,target,arrays['coupling_condition_ids'][indices],rng=rng,**options,**joint_pairing)
+        i,j=coupled['source_indices'],coupled['target_indices']
+        g0,target,indices=g0[i],target[j],indices[j]
+        diagnostics=coupled['diagnostics']
     t=rng.uniform(0,1,(count,1,1)).astype('float32')
-    return indices,(1-t)*g0+t*target,t,target-g0,coupled['diagnostics']
+    if bridge is None:state=(1-t)*g0+t*target
+    else:
+        from .flow_training import flow_path
+        state=flow_path(g0,target,t,source,rng,bridge)
+    return indices,state,t,target-g0,diagnostics
 
 
 def ode_options(cfg):
@@ -364,6 +396,9 @@ def draw_predictions(model,tensors,arrays,indices,source,stats,count,steps,seed,
                            for channel in source['channels']],axis=-1).astype('float32')
         prediction_stats=dict(stats,mean_profile=evaluate_periodic_profile(
             np.asarray(stats['mean_profile']),reference_theta,arrays['theta']))
+        if np.asarray(stats['scale']).ndim==2:
+            prediction_stats['scale']=np.exp(evaluate_periodic_profile(
+                np.log(np.asarray(stats['scale'])),reference_theta,arrays['theta']))
     encoded=integrate_velocity(model,torch.as_tensor(g0,device=next(model.parameters()).device),condition,
                                steps=steps,method=method,atol=atol,rtol=rtol,diagnostics=solver_stats)
     residual=decode_residual(encoded.cpu().numpy().reshape(len(indices),count,len(arrays['theta']),3),prediction_stats)
@@ -383,7 +418,9 @@ def flow_output_directory(cfg):
 
 
 def validate_velocity_checkpoint(checkpoint):
-    if checkpoint.get('model_config',{}).get('architecture')!='floral-filmfno-v1':
+    if checkpoint.get('inference_mode','ode')!='ode':
+        raise ValueError(f"{checkpoint['inference_mode']} checkpoint requires its dedicated inference interface, not generic ODE sampling")
+    if checkpoint.get('model_config',{}).get('architecture') not in ('floral-filmfno-v1','floral-filmfno-aligned-v2','raw-physical-film-v1','target-decoupled-film-v1','rotor-only-filmfno-v1','physical-film-path-v1','layer-wind-film-path-v1','angular-state-film-v1'):
         raise ValueError('Velocity architecture changed; retrain stage3 with FiLM-FNO. Existing stage1/stage2 assets can be reused.')
 
 
@@ -419,48 +456,252 @@ def flow_optimization(parameters,cfg):
     return optimizer,scheduler
 
 
+def step_flow_scheduler(scheduler,epoch,frequency=1):
+    """Equivalent to an epoch scheduler with Lightning frequency=N."""
+    if isinstance(frequency,bool) or not isinstance(frequency,int) or frequency<1:
+        raise ValueError('flow scheduler frequency must be a positive integer')
+    if epoch%frequency==0:scheduler.step()
+
+
+@torch.no_grad()
+def validation_velocity_mse(model,tensors,arrays,indices,source,stats,*,draws,batch_size,seed,device,
+                            time_weighting='none',bridge=None,low_frequency=None,complex_spectral=None,return_components=False):
+    """Evaluate independent FM paths on every held-out condition with fixed draws."""
+    from .conditioning import prepare_condition
+    from .objectives import velocity_loss,complex_spectral_loss
+    from .flow_training import flow_path
+    for name,value in [('draws',draws),('batch_size',batch_size)]:
+        if isinstance(value,bool) or not isinstance(value,int) or value<1:
+            raise ValueError(name+' must be a positive integer')
+    indices=np.asarray(indices,dtype=np.int64)
+    if indices.ndim!=1 or not len(indices):raise ValueError('validation indices required')
+    rng=np.random.default_rng(seed);ids=np.tile(indices,draws);total=0.;base_total=0.;spectral_total=0.;complex_total=0.
+    for start in range(0,len(ids),batch_size):
+        chosen=ids[start:start+batch_size];count=len(chosen)
+        g0=sample_multichannel_source(source,count,rng)
+        target=encode_residual(arrays['residual'][chosen],stats)
+        time=rng.uniform(0,1,(count,1,1)).astype('float32')
+        state=flow_path(g0,target,time,source,rng,bridge)
+        prediction=model(torch.as_tensor(state,device=device),torch.as_tensor(time,device=device),
+                         prepare_condition(model,tensors,chosen))
+        loss=velocity_loss(prediction,torch.as_tensor(target-g0,device=device),
+                           time=torch.as_tensor(time,device=device),time_weighting=time_weighting)
+        base_total+=float(loss)*count
+        if low_frequency is not None:
+            from .low_frequency_fm import low_frequency_velocity_loss
+            spectral=low_frequency_velocity_loss(prediction,torch.as_tensor(target-g0,device=device),
+                low_frequency['weights'],time=torch.as_tensor(time,device=device),time_weighting=time_weighting)
+            spectral_total+=float(spectral)*count
+            loss=loss+low_frequency['strength']*spectral
+        if complex_spectral is not None:
+            complex_loss=complex_spectral_loss(prediction,torch.as_tensor(target-g0,device=device),
+                time=torch.as_tensor(time,device=device),time_weighting=time_weighting)
+            complex_total+=float(complex_loss)*count
+            loss=loss+complex_spectral['strength']*complex_loss
+        if not torch.isfinite(loss):raise FloatingPointError('nonfinite validation velocity loss')
+        total+=float(loss)*count
+    if return_components:
+        return dict(total=total/len(ids),fm_mse=base_total/len(ids),low_frequency_fm_mse=spectral_total/len(ids),
+                    complex_spectral_l1=complex_total/len(ids))
+    return total/len(ids)
+
+
+def curve_endpoint_loss(model,tensors,arrays,splits,source,stats,rng,*,cases=4,draws=2,steps=16,method='heun'):
+    """Differentiate the integrated normalized residual mean, using train cases only.
+
+    This is a true ODE rollout, not x_t+(1-t)*v(x_t). The normalization makes
+    endpoint residual MSE equal to channel-balanced corrected-HF curve MSE.
+    """
+    from .conditioning import prepare_condition
+    from .residual_flow import integrate_velocity
+    for name,value in [('cases',cases),('draws',draws),('steps',steps)]:
+        if isinstance(value,bool) or not isinstance(value,int) or value<1:
+            raise ValueError(f'curve auxiliary {name} must be a positive integer')
+    if method not in ('euler','heun'):raise ValueError('curve auxiliary requires euler or heun')
+    if not splits['train']:raise ValueError('curve auxiliary requires training cases')
+    ids=rng.choice(splits['train'],min(cases,len(splits['train'])),replace=False)
+    condition={k:v.repeat_interleave(draws,0) for k,v in prepare_condition(model,tensors,ids).items()}
+    parameter=next(model.parameters())
+    g0=torch.as_tensor(sample_multichannel_source(source,len(ids)*draws,rng),device=parameter.device,dtype=parameter.dtype)
+    endpoint=integrate_velocity(model,g0,condition,steps=steps,method=method)
+    prediction=endpoint.reshape(len(ids),draws,endpoint.shape[1],endpoint.shape[2]).mean(1)
+    target=torch.as_tensor(encode_residual(arrays['residual'][ids],stats),device=parameter.device,dtype=parameter.dtype)
+    return (prediction-target).square().mean(),ids
+
+
 def train_flow(cfg,epochs=None):
     from .conditioning import fit_condition_scalers,standardize_conditions,tensor_conditions,prepare_condition
-    from .residual_flow import ConditionalVelocity
-    from .objectives import velocity_loss
-    device=setup(cfg); work=ROOT/cfg['work']; assets=work/'stage2'; out=flow_output_directory(cfg)
+    from .residual_flow import create_velocity_model as ConditionalVelocity
+    from .objectives import velocity_loss,validate_time_weighting,complex_spectral_loss,validate_velocity_regression
+    from .flow_training import epoch_indices,validate_bridge
+    method=coupling_method(cfg['pairing'],joint_enabled=cfg.get('joint_source',{}).get('enabled',False))
+    rotor_only=cfg['flow_model'].get('architecture')=='rotor-only-filmfno-v1'
+    time_weighting=validate_time_weighting(cfg.get('flow_time_weighting','none'))
+    regression=validate_velocity_regression(cfg.get('flow_velocity_loss','mse'),cfg.get('flow_huber_delta',1.))
+    regression_options=dict(regression=regression,huber_delta=cfg.get('flow_huber_delta',1.))
+    epoch_mode=cfg.get('flow_epoch_mode','monte_carlo')
+    validation_metric=cfg.get('flow_validation_metric','ode_curve_mse')
+    if validation_metric not in ('ode_curve_mse','velocity_mse'):raise ValueError('unknown flow validation metric')
+    scheduler_frequency=cfg.get('flow_scheduler_frequency',1)
+    if isinstance(scheduler_frequency,bool) or not isinstance(scheduler_frequency,int) or scheduler_frequency<1:
+        raise ValueError('flow scheduler frequency must be a positive integer')
+    complex_spectral=cfg.get('flow_complex_spectral')
+    if complex_spectral is not None:
+        if not isinstance(complex_spectral,dict) or set(complex_spectral)!={'strength'}:
+            raise ValueError('complex spectral options must contain strength only')
+        strength=complex_spectral['strength']
+        if isinstance(strength,bool) or not isinstance(strength,(float,int)) or not np.isfinite(strength) or strength<0:
+            raise ValueError('complex spectral strength must be finite and nonnegative')
+    if epoch_mode not in ('monte_carlo','dataloader'):raise ValueError('unknown flow epoch mode')
+    if epoch_mode=='dataloader' and method!='independent':raise ValueError('full-pass batches require independent coupling to preserve target coverage')
+    bridge=cfg.get('flow_bridge');validate_bridge(bridge)
+    device=setup(cfg); work=ROOT/cfg['work']; assets=work/cfg.get('flow_assets','stage2'); out=flow_output_directory(cfg)
     if out.exists():raise FileExistsError(out)
     if read_json(assets/'status.json')['status']!='complete':raise ValueError('Stage-two source is not admissible/complete; inspect stage2/status.json')
     provenance=read_json(assets/'provenance.json')
     if not all(digest(Path(p))==h for p,h in provenance.items()):raise ValueError('frozen stage-two inputs changed')
-    with np.load(assets/'paired_data.npz') as d:arrays={k:d[k] for k in d.files}
+    with np.load(assets/'paired_data.npz') as d:
+        arrays={k:d[k] for k in d.files if not rotor_only or k not in ('field_features','z','weights')}
     splits=read_json(assets/'splits.json'); stats=read_json(assets/'normalization.json'); source=read_json(assets/'source.json')
     validate_flow_assets(arrays,splits,stats,source,split_method=cfg.get('hf_split',{}).get('method','geometry'))
-    scalers=fit_condition_scalers(arrays,splits['train'])
-    tensors=tensor_conditions(standardize_conditions(arrays,scalers),arrays,device)
+    loss_balance=None
+    if cfg.get('flow_loss_balancing'):
+        from .loss_balancing import fit_loss_weights,sample_loss_weights
+        loss_balance=fit_loss_weights(arrays['residual'],arrays['conditions'],splits['train'],stats,cfg['flow_loss_balancing'])
+    joint_pairing=None
+    if cfg.get('joint_source',{}).get('enabled',False):
+        from .joint_source_coupling import load_joint_source
+        source,arrays,joint_pairing=load_joint_source(cfg,arrays)
+        validate_flow_assets(arrays,splits,stats,source,split_method=cfg.get('hf_split',{}).get('method','geometry'))
+    low_frequency=None
+    if cfg.get('flow_low_frequency_fm') is not None:
+        from .low_frequency_fm import fit_low_frequency_weights,low_frequency_velocity_loss
+        low_frequency=fit_low_frequency_weights(arrays['residual'],splits['train'],stats,cfg['flow_low_frequency_fm'])
+    explicit=cfg['flow_model'].get('explicit_physical_conditioning',False) or cfg['flow_model'].get('scalar_geometry_film',False) or cfg['flow_model'].get('architecture')=='physical-film-path-v1'
+    layer_wind=cfg['flow_model'].get('architecture')=='layer-wind-film-path-v1'
+    angular_state=cfg['flow_model'].get('architecture')=='angular-state-film-v1'
+    wind_profile=None
+    if explicit or layer_wind or angular_state:
+        from .conditioning import geometry_from_cache
+        manifest=read_json(work/'lf_cache/manifest.json')
+        arrays=geometry_from_cache(arrays,work/'lf_cache',manifest)
+        if layer_wind:
+            wind_profile={key:manifest['config'][key] for key in ('wind_profile','height','rotor_bottom_height','wind_reference_height','shear_exponent')}
+    scalers=fit_condition_scalers(arrays,splits['train'],include_geometry=explicit,include_field=not rotor_only,wind_profile=wind_profile,include_scalar_geometry=angular_state)
+    tensors=tensor_conditions(standardize_conditions(arrays,scalers),arrays,device,include_height=not rotor_only)
     model=ConditionalVelocity(**cfg['flow_model'],n_targets=3,lf_channels=3,n_conditions=2).to(device)
     optim,scheduler=flow_optimization(model.parameters(),cfg)
     stopping=FlowEarlyStopping(cfg['flow_patience'],cfg.get('flow_min_delta',0.))
-    rng=np.random.default_rng(cfg['seed']); out.mkdir(); history=[]; best=float('inf'); best_epoch=0
+    curve_cfg=cfg.get('curve_auxiliary',{})
+    curve_weight=curve_cfg.get('weight',0.)
+    if isinstance(curve_weight,bool) or not isinstance(curve_weight,(int,float)) or not np.isfinite(curve_weight) or curve_weight<0:
+        raise ValueError('curve auxiliary weight must be finite and nonnegative')
+    curve_options={k:v for k,v in curve_cfg.items() if k!='weight'}
+    curve_rng=np.random.default_rng(cfg['seed']+50000)
+    rng=np.random.default_rng(cfg['seed']); out.mkdir(); history=[]; best=float('inf'); best_epoch=0; total_updates=0
+    if loss_balance is not None:save_json(out/'loss_weights.json',loss_balance)
+    if low_frequency is not None:save_json(out/'low_frequency_weights.json',low_frequency)
     for epoch in range(1,(epochs or cfg['flow_epochs'])+1):
-        model.train(); losses=[]; errors=[]; learning_rate=optim.param_groups[0]['lr']
-        for _ in range(cfg['updates_per_epoch']):
-            ids,xt,t,u,diagnostics=paired_batch(arrays,splits,stats,source,cfg['batch_size'],rng,cfg['pairing'])
+        model.train(); losses=[]; weighted_losses=[]; errors=[]; curve_losses=[]; total_losses=[]; joint_diagnostics=[]; learning_rate=optim.param_groups[0]['lr']
+        batch_sizes=[];visited=[];spectral_losses=[];complex_losses=[]
+        batches=epoch_indices(splits['train'],batch_size=cfg['batch_size'],seed=cfg['seed'],epoch=epoch) if epoch_mode=='dataloader' else (None for _ in range(cfg['updates_per_epoch']))
+        for batch_indices in batches:
+            count=cfg['batch_size'] if batch_indices is None else len(batch_indices)
+            ids,xt,t,u,diagnostics=paired_batch(arrays,splits,stats,source,count,rng,cfg['pairing'],joint_pairing=joint_pairing,target_indices=batch_indices,bridge=bridge)
+            batch_sizes.append(count);visited.extend(ids.tolist())
+            if joint_pairing is not None:joint_diagnostics.append(diagnostics)
             unique,inverse=np.unique(ids,return_inverse=True)
             condition={k:v[inverse] for k,v in prepare_condition(model,tensors,unique).items()}
             optim.zero_grad(set_to_none=True)
-            loss=velocity_loss(model(torch.as_tensor(xt,device=device),torch.as_tensor(t,device=device),condition),torch.as_tensor(u,device=device))
+            time=torch.as_tensor(t,device=device);target_velocity=torch.as_tensor(u,device=device)
+            prediction=model(torch.as_tensor(xt,device=device),time,condition)
+            loss_options={}
+            if loss_balance is not None:
+                loss_options=dict(sample_weights=sample_loss_weights(arrays['conditions'],ids,loss_balance),
+                                  angular_weights=loss_balance['angular_weights'])
+            base_loss=velocity_loss(prediction,target_velocity,time=time,time_weighting=time_weighting,**loss_options,**regression_options)
+            loss=base_loss
+            if low_frequency is not None:
+                spectral=low_frequency_velocity_loss(prediction,target_velocity,low_frequency['weights'],
+                    time=time,time_weighting=time_weighting)
+                loss=base_loss+low_frequency['strength']*spectral
+                spectral_losses.append(float(spectral.detach()))
+            if complex_spectral is not None:
+                complex_loss=complex_spectral_loss(prediction,target_velocity,time=time,time_weighting=time_weighting)
+                loss=loss+complex_spectral['strength']*complex_loss
+                complex_losses.append(float(complex_loss.detach()))
             if not torch.isfinite(loss):raise FloatingPointError('nonfinite velocity loss')
-            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True); optim.step()
-            losses.append(float(loss.detach())); errors.append(diagnostics['marginal_error'])
-        scheduler.step()
-        row=dict(epoch=epoch,velocity_mse=float(np.mean(losses)),sinkhorn_marginal_error=max(errors),
+            loss.backward()
+            total_value=float(loss.detach())
+            if curve_weight:
+                # Separate forward/backward releases the large FM graph before
+                # constructing the rollout graph; parameters stay fixed until step.
+                curve_loss,_=curve_endpoint_loss(model,tensors,arrays,splits,source,stats,curve_rng,**curve_options)
+                if not torch.isfinite(curve_loss):raise FloatingPointError('nonfinite curve auxiliary loss')
+                (curve_weight*curve_loss).backward()
+                curve_losses.append(float(curve_loss.detach()))
+                total_value+=curve_weight*curve_losses[-1]
+            torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True); optim.step()
+            total_updates+=1
+            losses.append(float(velocity_loss(prediction.detach(),target_velocity)) if time_weighting!='none' or loss_balance is not None or regression!='mse' else float(base_loss.detach()))
+            weighted_losses.append(float(base_loss.detach()))
+            if 'marginal_error' in diagnostics:errors.append(diagnostics['marginal_error'])
+            total_losses.append(total_value)
+        step_flow_scheduler(scheduler,epoch,scheduler_frequency)
+        row=dict(epoch=epoch,velocity_mse=float(np.average(losses,weights=batch_sizes)),
                  learning_rate=learning_rate,next_learning_rate=optim.param_groups[0]['lr'])
+        if loss_balance is not None:
+            row['balanced_velocity_loss']=float(np.average(weighted_losses,weights=batch_sizes))
+        if epoch_mode=='dataloader':
+            if sorted(visited)!=sorted(splits['train']):raise RuntimeError('training epoch did not visit each condition exactly once')
+            row.update(epoch_mode=epoch_mode,epoch_samples=sum(batch_sizes),epoch_unique_conditions=len(set(visited)),
+                       updates_in_epoch=len(batch_sizes),optimizer_updates=total_updates)
+        if bridge is not None:row['bridge_method']=bridge['method']
+        if errors:row['sinkhorn_marginal_error']=max(errors)
+        if method=='independent':row['coupling_method']='independent'
+        if time_weighting!='none':
+            row.update(time_weighting=time_weighting)
+            row['time_weighted_velocity_'+regression]=float(np.average(weighted_losses,weights=batch_sizes))
+        if regression!='mse':
+            row.update(velocity_objective=regression,huber_delta=regression_options['huber_delta'],
+                       optimized_velocity_loss=float(np.average(total_losses,weights=batch_sizes)))
+        if low_frequency is not None:
+            row.update(low_frequency_fm_loss=float(np.average(spectral_losses,weights=batch_sizes)),
+                       optimized_velocity_loss=float(np.average(total_losses,weights=batch_sizes)))
+        if complex_spectral is not None:
+            row.update(complex_spectral_l1=float(np.average(complex_losses,weights=batch_sizes)),
+                       optimized_velocity_loss=float(np.average(total_losses,weights=batch_sizes)))
+        if joint_diagnostics:
+            row.update({k:float(np.mean([d[k] for d in joint_diagnostics])) for k in
+                ('independent_fraction','condition_chi2_before','condition_chi2_after','kernel_transport_cost','transport_kl','joint_objective')})
+        if curve_weight:
+            row.update(ode_curve_mse=float(np.mean(curve_losses)),weighted_curve_loss=curve_weight*float(np.mean(curve_losses)),
+                       total_loss=float(np.mean(total_losses)))
         if epoch==1 or epoch%cfg['validate_every']==0 or epoch==(epochs or cfg['flow_epochs']):
-            model.eval(); result=draw_predictions(model,tensors,arrays,splits['val'],source,stats,cfg['validation_draws'],cfg['ode_steps'],cfg['seed']+10000,**ode_options(cfg))
-            score=float(np.mean(((result['mean']-arrays['target'][splits['val']])/np.array(stats['scale']))**2))
-            row['val_standardized_curve_mse']=score
+            model.eval()
+            if validation_metric=='velocity_mse':
+                score=validation_velocity_mse(model,tensors,arrays,splits['val'],source,stats,
+                    draws=cfg['validation_draws'],batch_size=cfg['batch_size'],seed=cfg['seed']+10000,
+                    device=device,time_weighting=time_weighting,bridge=bridge,low_frequency=low_frequency,
+                    complex_spectral=complex_spectral,return_components=low_frequency is not None or complex_spectral is not None)
+                key='val_time_weighted_velocity_mse' if time_weighting!='none' else 'val_velocity_mse'
+                if low_frequency is not None or complex_spectral is not None:
+                    row[key]=score['fm_mse']
+                    if low_frequency is not None:row['val_low_frequency_fm_loss']=score['low_frequency_fm_mse']
+                    if complex_spectral is not None:row['val_complex_spectral_l1']=score['complex_spectral_l1']
+                    row['val_optimized_velocity_loss']=score['total'];score=score['total']
+                else:row[key]=score
+            else:
+                result=draw_predictions(model,tensors,arrays,splits['val'],source,stats,cfg['validation_draws'],cfg['ode_steps'],cfg['seed']+10000,**ode_options(cfg))
+                score=float(np.mean(((result['mean']-arrays['target'][splits['val']])/np.array(stats.get('validation_scale',stats['scale'])))**2))
+                row['val_standardized_curve_mse']=score
             stopping.observe(epoch,score)
             if score<best:
                 best=score; best_epoch=epoch
                 torch.save(dict(model=model.state_dict(),model_config=model.config,scalers=scalers,source=source,residual_stats=stats,
                                 optimizer=optim.state_dict(),scheduler=scheduler.state_dict(),
                                 config=cfg,targets=TARGETS,theta=arrays['theta'].tolist(),epoch=epoch,splits=splits,
+                                loss_balancing=loss_balance,**({'low_frequency_fm':low_frequency} if low_frequency is not None else {}),
                                 lf_checkpoint_sha256=digest(work/'stage1'/'best.pt'),target_contract=TARGET_CONTRACT,input_contract=INPUT_CONTRACT),out/'best.pt')
         history.append(row); save_json(out/'history.json',history); print(json.dumps(row),flush=True)
         if stopping.should_stop(epoch):break
@@ -472,21 +713,24 @@ def train_flow(cfg,epochs=None):
         report[split]=dict(corrected=metrics(result['mean'],arrays['target'][ids]),lf=metrics(arrays['lf_prediction'][ids],arrays['target'][ids]),
                            train_mean=metrics(mean_baseline,arrays['target'][ids]))
         np.savez_compressed(out/f'{split}_predictions.npz',**result,target=arrays['target'][ids],lf=arrays['lf_prediction'][ids],theta=arrays['theta'],case_ids=arrays['case_ids'][ids],targets=np.array(TARGETS))
-    report.update(best_epoch=best_epoch,epochs_run=epoch,uncertainty='Uncalibrated generated dispersion',conditional_source_independence_guaranteed=False)
+    report.update(best_epoch=best_epoch,epochs_run=epoch,uncertainty='Uncalibrated generated dispersion',
+                  coupling_method=('joint_kernel_ot' if joint_pairing is not None else method),
+                  conditional_source_independence_guaranteed=method=='independent')
     save_json(out/'metrics.json',report); print(json.dumps(report),flush=True); return report
 
 
 def predict(cfg,cases,output,parameters=None,lf_only=False,n_theta=None):
     from .conditioning import standardize_conditions,tensor_conditions
-    from .residual_flow import ConditionalVelocity
+    from .residual_flow import create_velocity_model as ConditionalVelocity
     device=setup(cfg); work=ROOT/cfg['work']; cache=work/'lf_cache'
     out=Path(output)
     if out.exists() or out.suffix!='.npz':raise ValueError('output must be a new .npz path')
     lf_checkpoint=torch.load(work/'stage1'/'best.pt',map_location='cpu',weights_only=False)
-    if parameters is not None:arrays=lf_predict_parameters(lf_checkpoint,parameters,device,n_theta=n_theta)
+    rotor_only=not lf_only and cfg.get('flow_model',{}).get('architecture')=='rotor-only-filmfno-v1'
+    if parameters is not None:arrays=lf_predict_parameters(lf_checkpoint,parameters,device,n_theta=n_theta,return_field_features=not rotor_only)
     else:
         manifest=read_json(cache/'manifest.json'); lookup={r['case_id']:i for i,r in enumerate(manifest['records'])}
-        arrays=lf_predict(lf_checkpoint,cache,manifest,[lookup[i] for i in cases],device,n_theta=n_theta)
+        arrays=lf_predict(lf_checkpoint,cache,manifest,[lookup[i] for i in cases],device,n_theta=n_theta,return_field_features=not rotor_only)
     if lf_only:
         out.parent.mkdir(parents=True,exist_ok=True)
         np.savez_compressed(out,prediction=arrays['lf_prediction'],theta=arrays['theta'],case_ids=arrays['case_ids'],targets=np.array(TARGETS),input_contract=np.array(INPUT_CONTRACT))
@@ -495,23 +739,23 @@ def predict(cfg,cases,output,parameters=None,lf_only=False,n_theta=None):
     validate_velocity_checkpoint(ck)
     if ck.get('input_contract')!=INPUT_CONTRACT or ck['targets']!=TARGETS or ck['target_contract']!=TARGET_CONTRACT or digest(work/'stage1'/'best.pt')!=ck['lf_checkpoint_sha256']:raise ValueError('input/target or LF checkpoint mismatch')
     model=ConditionalVelocity(**ck['model_config']).to(device).eval(); model.load_state_dict(ck['model'])
-    tensors=tensor_conditions(standardize_conditions(arrays,ck['scalers']),arrays,device)
+    tensors=tensor_conditions(standardize_conditions(arrays,ck['scalers']),arrays,device,include_height=not rotor_only)
     result=draw_predictions(model,tensors,arrays,np.arange(len(arrays['case_ids'])),ck['source'],ck['residual_stats'],cfg['evaluation_draws'],cfg['ode_steps'],cfg['seed'],reference_theta=np.asarray(ck['theta']),**ode_options(cfg))
     out.parent.mkdir(parents=True,exist_ok=True)
-    from .resolution import SOURCE_SCOPE
+    from .resolution import source_scope
     np.savez_compressed(out,**result,theta=arrays['theta'],case_ids=arrays['case_ids'],targets=np.array(TARGETS),input_contract=np.array(INPUT_CONTRACT),
-                        training_theta=np.asarray(ck['theta']),source_scope=np.array(SOURCE_SCOPE))
+                        training_theta=np.asarray(ck['theta']),source_scope=np.array(source_scope(ck['source'])))
     return {'output':str(out.resolve()),'targets':TARGETS}
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage',choices=['prepare','stage1','stage2','stage3','predict','predict-lf','predict-grid','predict-grid-lf'])
+    parser.add_argument('stage',choices=['prepare','prepare-hf','stage1','stage2','stage2-v2','stage3','predict','predict-lf','predict-grid','predict-grid-lf'])
     parser.add_argument('--config',type=Path,default=ROOT/'configs'/'single_blade.json')
     parser.add_argument('--epochs',type=int)
     parser.add_argument('--n-theta',type=int,help='uniform periodic angular points for inference; default is checkpoint grid, or grid specification')
     parser.add_argument('--query-batch-size',type=int,help='condition chunk size for grid inference; training batch size is unchanged')
-    parser.add_argument('--hf-only',action='store_true',help='49 LF cases only; explicitly a pipeline smoke dataset')
+    parser.add_argument('--hf-only',action='store_true',help='paired LF cases only; explicitly a pipeline smoke dataset')
     query=parser.add_mutually_exclusive_group()
     query.add_argument('--cases',nargs='+'); query.add_argument('--parameters',type=Path)
     parser.add_argument('--output',type=Path)
@@ -519,8 +763,14 @@ def main():
     if args.n_theta is not None and args.stage not in ('predict','predict-lf','predict-grid','predict-grid-lf'):parser.error('--n-theta is for inference only')
     if args.query_batch_size is not None and args.stage not in ('predict-grid','predict-grid-lf'):parser.error('--query-batch-size is for grid inference only')
     if args.stage=='prepare':prepare(cfg,args.hf_only)
+    elif args.stage=='prepare-hf':
+        from .hf_dataset import prepare_hf
+        prepare_hf(cfg)
     elif args.stage=='stage1':train_lf(cfg,args.epochs)
     elif args.stage=='stage2':prepare_residuals(cfg)
+    elif args.stage=='stage2-v2':
+        from .joint_source_coupling import prepare_joint_source
+        prepare_joint_source(cfg)
     elif args.stage=='stage3':train_flow(cfg,args.epochs)
     elif args.stage in ('predict-grid','predict-grid-lf'):
         from .parameter_grid import predict_grid

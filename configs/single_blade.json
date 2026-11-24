@@ -1,11 +1,10 @@
 {
-  "hf_root": "../仿真/High-fidelity/num49/results_origin_detailed/results_origin_detailed",
   "lf_source": "../仿真/dataset/outputs/results_PC_momentum_c1",
   "lf_inputs": "../仿真/dataset/outputs/seed1492_n1000_inputs/cases.csv",
-  "work": "artifacts/single_blade_parameters_v1",
+  "work": "artifacts/single_blade_parameters_hf100_v1",
   "device": "cuda",
   "seed": 42,
-  "batch_size": 256,
+  "batch_size": 16,
   "workers": 8,
   "lf_epochs": 100,
   "lf_lr": 0.001,
@@ -28,7 +27,7 @@
   },
   "flow_epochs": 2000,
   "flow_lr": 0.001,
-  "updates_per_epoch": 1,
+  "updates_per_epoch": 32,
   "flow_patience": 90,
   "flow_min_delta": 0.0001,
   "validate_every": 5,
@@ -41,7 +40,7 @@
   "flow_model": {
     "width": 64,
     "blocks": 4,
-    "modes": 12,
+    "modes": 6,
     "height_width": 8,
     "lift_ratio": 4,
     "projection_ratio": 4,
@@ -50,13 +49,22 @@
     "direct_conditioning": true
   },
   "pairing": {
-    "kernel": "sobolev_rbf",
-    "epsilon": 0.02,
-    "derivative_weight": 0.01,
-    "max_iter": 5000,
-    "tol": 1e-06
+    "method": "independent"
   },
-  "flow_output": "stage3_film_concat_dopri5_e2000",
+  "flow_output": "stage3_floral_fixed_source_b16_u32_e2000",
   "flow_weight_decay": 0.001,
-  "flow_lr_gamma": 1.0
+  "flow_lr_gamma": 1.0,
+  "flow_time_weighting": "floral_quadratic",
+  "hf_roots": [
+    "../仿真/High-fidelity/num49/results_origin_detailed/results_origin_detailed",
+    "../仿真/High-fidelity/num51/results_origin_detailed"
+  ],
+  "expected_hf_cases": 100,
+  "flow_assets": "stage2_floral_fixed_source_hf100_seed42",
+  "source_design": {
+    "method": "floral_fixed_matern",
+    "lengthscale": 0.001,
+    "outputscale": 1.0,
+    "residual_covariance_factor": 2.0
+  }
 }
