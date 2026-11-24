@@ -1,0 +1,4 @@
+/.venv/
+/upstream/
+/results/
+*.log
