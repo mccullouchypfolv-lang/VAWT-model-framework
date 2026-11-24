@@ -1,0 +1,13 @@
+{
+  "version": "1.0.2",
+  "files": {
+    "neuralop_embeddings.py": {
+      "url": "https://raw.githubusercontent.com/neuraloperator/neuraloperator/1.0.2/neuralop/layers/embeddings.py",
+      "sha256": "a4c97c9443a8522af7d76424b2973036bd4841264cf4d7b800c07b17b870b857"
+    },
+    "NEURALOP_LICENSE": {
+      "url": "https://raw.githubusercontent.com/neuraloperator/neuraloperator/1.0.2/LICENSE",
+      "sha256": "5f335b0603acfb1d180bf3117492e2076562075cc9b6353a3b94d5d5bc03ef33"
+    }
+  }
+}

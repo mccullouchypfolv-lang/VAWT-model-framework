@@ -62,7 +62,7 @@ def predict_grid(cfg, spec, output, n_theta=None, lf_only=False, query_batch_siz
     from . import blade_pipeline as pipeline
     from .conditioning import standardize_conditions, tensor_conditions
     from .data import digest
-    from .model import FiLMFNO
+    from .model import create_lf_model as FiLMFNO
     from .residual_flow import create_velocity_model as ConditionalVelocity
 
     if (isinstance(query_batch_size, (bool, np.bool_))

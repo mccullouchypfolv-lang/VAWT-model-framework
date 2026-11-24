@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset,DataLoader
 
 
-def compact_lf_inputs(x,a,z,theta,stats,config):
+def compact_lf_inputs(x,a,z,theta,stats,config,*,separate=False):
     """Scalar geometry and prescribed wind only; height never enters the model.
 
     One training-fitted reference-wind scale is shared by all heights, preserving
@@ -29,7 +29,11 @@ def compact_lf_inputs(x,a,z,theta,stats,config):
     gm,gst=np.asarray(stats['x_mean']),np.asarray(stats['x_std'])
     if np.any(ast<=0) or np.any(gst<=0):raise ValueError('invalid training input scales')
     result=dict(x=(wind-am[0])/ast[0],theta=theta)
-    result['a']=np.concatenate(((a-am)/ast,(geometry-gm)/gst))
+    if separate:
+        from .separate_lf import SCALARS
+        conditions=(a-am)/ast;geom=(geometry-gm)/gst
+        result.update({key:np.array([value]) for key,value in zip(SCALARS,(*conditions,*geom))})
+    else:result['a']=np.concatenate(((a-am)/ast,(geometry-gm)/gst))
     if not all(np.isfinite(v).all() for v in result.values()):raise ValueError('nonfinite compact LF input')
     return {k:v.astype('float32') for k,v in result.items()}
 
@@ -51,8 +55,8 @@ class LFData(Dataset):
                         a=(a-np.asarray(stats['a_mean'],dtype='float32'))/np.asarray(stats['a_std'],dtype='float32'),
                         z=(np.asarray(saved['z'],dtype='float32')-config['rotor_bottom_height'])/config['height'],
                         theta=np.asarray(saved['theta'],dtype='float32'),weights=np.asarray(saved['weights'],dtype='float32'))
-            if self.input_layout=='scalar-geometry-layer-wind-v1':
-                result=compact_lf_inputs(x,a,saved['z'],saved['theta'],stats,config)
+            if self.input_layout in ('scalar-geometry-layer-wind-v1','separate-scalar-layer-wind-v1'):
+                result=compact_lf_inputs(x,a,saved['z'],saved['theta'],stats,config,separate=self.input_layout=='separate-scalar-layer-wind-v1')
             if self.require_targets:
                 target=np.asarray(saved['y'],dtype='float32')
                 result['y']=(target-np.asarray(stats['y_mean'],dtype='float32'))/np.asarray(stats['y_std'],dtype='float32')
@@ -69,6 +73,8 @@ def to_device(batch,device):return {k:v.to(device) for k,v in batch.items()}
 
 
 def forward(model,batch,features=False):
+    if model.config.get('input_layout')=='separate-scalar-layer-wind-v1':
+        return model(batch['x'],**{k:batch[k] for k in (*model.scalar_names,'theta')},return_features=features)
     if model.config.get('input_layout')=='scalar-geometry-layer-wind-v1':
         return model(batch['x'],batch['a'],theta=batch['theta'],return_features=features)
     return model(*(batch[k] for k in ('x','a','z','theta','weights')),return_features=features)

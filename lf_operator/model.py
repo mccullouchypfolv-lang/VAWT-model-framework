@@ -105,3 +105,10 @@ class FiLMFNO(nn.Module):
         if return_features:
             return dict(prediction=prediction,field_features=field,rotor_features=rotor_features)
         return prediction
+
+
+def create_lf_model(**config):
+    if config.get('input_layout')=='separate-scalar-layer-wind-v1':
+        from .separate_lf import SeparateScalarLFFNO
+        return SeparateScalarLFFNO(**config)
+    return FiLMFNO(**config)

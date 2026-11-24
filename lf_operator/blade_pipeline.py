@@ -16,7 +16,7 @@ TARGETS=['Cl_blade','Cd_blade','CM_blade']
 
 
 def validate_parameter_contract(checkpoint,manifest=None):
-    compact=checkpoint.get('model_config',{}).get('input_layout')=='scalar-geometry-layer-wind-v1'
+    compact=checkpoint.get('model_config',{}).get('input_layout') in ('scalar-geometry-layer-wind-v1','separate-scalar-layer-wind-v1')
     features=['uninduced_wind_m_s'] if compact else list(FEATURES)
     conditions=list(CONDITIONS)+list(FEATURES) if compact else list(CONDITIONS)
     if checkpoint.get('input_contract')!=INPUT_CONTRACT or checkpoint.get('features')!=features or checkpoint.get('conditions')!=conditions:
@@ -155,7 +155,7 @@ def metrics(prediction,target):
 
 @torch.no_grad()
 def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None,*,return_field_features=True):
-    from .model import FiLMFNO
+    from .model import create_lf_model as FiLMFNO
     from .training_data import loader,to_device,forward
     validate_parameter_contract(checkpoint,manifest)
     if checkpoint['targets']!=TARGETS or manifest['targets']!=TARGETS or checkpoint['target_contract']!=TARGET_CONTRACT:raise ValueError('old target checkpoint/cache rejected')
@@ -193,7 +193,7 @@ def lf_predict(checkpoint,cache,manifest,indices,device,n_theta=None,*,return_fi
 @torch.no_grad()
 def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None,*,return_field_features=True):
     """Inference from declared variables only. No LF/HF solver outputs are opened."""
-    from .model import FiLMFNO
+    from .model import create_lf_model as FiLMFNO
     validate_parameter_contract(checkpoint)
     input_config=dict(checkpoint['source_config'])
     if n_theta is not None:input_config['ntheta']=n_theta
@@ -216,9 +216,9 @@ def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None,*
     z=(z-cfg['rotor_bottom_height'])/cfg['height']
     if model is None:
         model=FiLMFNO(**checkpoint['model_config']).to(device).eval();model.load_state_dict(checkpoint['model'])
-    if model.config.get('input_layout')=='scalar-geometry-layer-wind-v1':
+    if model.config.get('input_layout') in ('scalar-geometry-layer-wind-v1','separate-scalar-layer-wind-v1'):
         from .training_data import compact_lf_inputs,forward
-        compact=[compact_lf_inputs(v['x'],v['a'],v['z'],v['theta'],stats,cfg) for v in inputs]
+        compact=[compact_lf_inputs(v['x'],v['a'],v['z'],v['theta'],stats,cfg,separate=model.config.get('input_layout')=='separate-scalar-layer-wind-v1') for v in inputs]
         batch={k:torch.as_tensor(np.stack([v[k] for v in compact]),device=device) for k in compact[0]}
         result=forward(model,batch,features=True)
     else:
@@ -233,7 +233,7 @@ def lf_predict_parameters(checkpoint,parameters,device,n_theta=None,model=None,*
 
 
 def train_lf(cfg,epochs=None):
-    from .model import FiLMFNO
+    from .model import create_lf_model as FiLMFNO
     from .training_data import loader,to_device,forward
     device=setup(cfg); work=ROOT/cfg['work']; cache=work/'lf_cache'; out=work/'stage1'
     if out.exists() and any(out.iterdir()):raise FileExistsError(out)
@@ -256,7 +256,7 @@ def train_lf(cfg,epochs=None):
     stats=lf_statistics(cache,manifest,splits['train']); out.mkdir(exist_ok=True)
     save_json(out/'splits.json',splits);save_json(out/'split_design.json',split_report)
     model_cfg=dict(cfg['lf_model'],n_features=2,n_conditions=2,n_outputs=3)
-    compact=model_cfg.get('input_layout')=='scalar-geometry-layer-wind-v1'
+    compact=model_cfg.get('input_layout') in ('scalar-geometry-layer-wind-v1','separate-scalar-layer-wind-v1')
     if compact:model_cfg.update(n_features=1,n_conditions=4)
     loader_options={'input_layout':model_cfg['input_layout']} if compact else {}
     model=FiLMFNO(**model_cfg).to(device)
