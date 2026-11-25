@@ -8,7 +8,7 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
-from ..data.lf_data import load_lf_data
+from .lf_data import load_lf_data
 from .lf_solver import LF_Solver
 
 
