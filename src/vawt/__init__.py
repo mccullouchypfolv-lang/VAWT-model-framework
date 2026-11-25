@@ -1,0 +1,1 @@
+"""VAWT model components."""
