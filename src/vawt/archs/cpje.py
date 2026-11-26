@@ -4,10 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-
-def _fourier_features(angles, orders):
-    phase = angles.unsqueeze(-1) * orders
-    return torch.cat((phase.cos(), phase.sin()), dim=-1)
+from ..periodic import fourier_features
 
 
 class DynamicRelationBias(nn.Module):
@@ -28,7 +25,7 @@ class DynamicRelationBias(nn.Module):
     def forward(self, conditions, theta):
         # Attention rows are queries and columns are keys.
         relative_angles = theta[:, None] - theta[None, :]
-        periodic = _fourier_features(relative_angles, self.orders)
+        periodic = fourier_features(relative_angles, self.orders)
         basis = torch.cat((torch.ones_like(periodic[..., :1]), periodic), dim=-1)
         coefficients = self.coefficients(conditions).reshape(
             -1, self.variables, self.variables, self.coefficient_count
@@ -123,7 +120,7 @@ class CPJE(nn.Module):
             encoder(curve).transpose(1, 2)
             for encoder, curve in zip(self.circular_encoders, lf_curves.split(1, dim=1))
         ], dim=1)
-        periodic = self.periodic_embedding(_fourier_features(theta, self.orders))
+        periodic = self.periodic_embedding(fourier_features(theta, self.orders))
         aerodynamic_tokens = aerodynamic_tokens + self.variable_embedding[:, None] + periodic
 
         tokens = torch.cat((global_tokens, aerodynamic_tokens.flatten(1, 2)), dim=1)
