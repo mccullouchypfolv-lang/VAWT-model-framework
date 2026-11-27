@@ -29,6 +29,8 @@ def load_flow_checkpoint(path, *, device="cpu"):
     model = ResidualFlow(
         standardize_cpje_conditions=checkpoint.get("standardize_cpje_conditions", False),
         time_frequency_max=checkpoint.get("time_frequency_max", 1000.0),
+        physical_bypass=checkpoint.get("physical_bypass", False),
+        independent_velocity_heads=checkpoint.get("independent_velocity_heads", False),
     )
     model.load_state_dict(checkpoint["model"])
     normalizer = ResidualNormalizer(checkpoint["residual_mean"], checkpoint["residual_std"])
@@ -40,12 +42,12 @@ def generate_hf(model, lf_solver, conditions, normalizer, *, steps=128, generato
     """Return one HF draw per condition, shaped [B, 3, 160]."""
     lf = lf_solver(conditions)
     theta = lf_solver.theta
-    global_features, aero_features = model.cpje(conditions, lf, theta)
+    global_features, aero_features, physical = model.encode_conditions(conditions, lf, theta)
     source = sample_prior(lf, generator=generator)
 
     def velocity(time, state):
         return model.dpft(global_features, aero_features, state,
-                          time.expand(len(source), 1), theta=theta)
+                          time.expand(len(source), 1), theta=theta, physical=physical)
 
     residual = normalizer.denormalize(rk4(velocity, source, steps=steps))
     return lf + residual

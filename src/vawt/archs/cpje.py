@@ -115,11 +115,15 @@ class CPJE(nn.Module):
         self.condition_mean.copy_(mean)
         self.condition_std.copy_(std)
 
+    def normalize_conditions(self, conditions):
+        if self.condition_mean is None:
+            return conditions
+        return (conditions - self.condition_mean) / self.condition_std
+
     def forward(self, conditions, lf_curves, theta):
         if conditions.ndim != 2 or conditions.shape[1] != self.parameters_count:
             raise ValueError("Expected conditions with shape [B, 4]")
-        if self.condition_mean is not None:
-            conditions = (conditions - self.condition_mean) / self.condition_std
+        conditions = self.normalize_conditions(conditions)
         if lf_curves.ndim != 3 or lf_curves.shape[:2] != (conditions.shape[0], self.variables):
             raise ValueError("Expected LF curves with shape [B, 3, N]")
         batch, _, angles = lf_curves.shape

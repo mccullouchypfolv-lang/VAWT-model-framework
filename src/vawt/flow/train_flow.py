@@ -51,7 +51,10 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
     val_batches = DataLoader(datasets["val"], batch_size=batch_size)
     train_rng = torch.Generator(device=device).manual_seed(seed)
     val_rng = torch.Generator(device=device)
-    model = ResidualFlow(standardize_cpje_conditions=True, time_frequency_max=TIME_FREQUENCY_MAX)
+    model = ResidualFlow(
+        standardize_cpje_conditions=True, time_frequency_max=TIME_FREQUENCY_MAX,
+        physical_bypass=True, independent_velocity_heads=True,
+    )
     model.cpje.fit_condition_normalization(training_data.conditions)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -74,6 +77,8 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
                 "standardize_cpje_conditions": True,
                 "dpft_blocks": len(model.dpft.blocks),
                 "time_frequency_max": TIME_FREQUENCY_MAX,
+                "physical_bypass": True,
+                "independent_velocity_heads": True,
                 "residual_mean": training_data.normalizer.mean,
                 "residual_std": training_data.normalizer.std,
                 "lf_checkpoint": str(lf_checkpoint),
@@ -85,6 +90,7 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
         "seed": seed, "batch_size": batch_size, "learning_rate": learning_rate,
         "standardize_cpje_conditions": True, "dpft_blocks": len(model.dpft.blocks),
         "time_frequency_max": TIME_FREQUENCY_MAX,
+        "physical_bypass": True, "independent_velocity_heads": True,
         "weight_decay": weight_decay, "splits": {name: len(data) for name, data in datasets.items()},
     }
     (output / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

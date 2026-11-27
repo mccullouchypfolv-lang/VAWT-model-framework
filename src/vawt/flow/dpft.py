@@ -10,12 +10,16 @@ from ..periodic import fourier_features
 
 
 class GlobalTimeEncoder(nn.Module):
-    def __init__(self, width, global_tokens, *, time_frequency_max=1000.0):
+    def __init__(self, width, global_tokens, *, time_frequency_max=1000.0, physical_bypass=False):
         super().__init__()
         self.global_projection = nn.Sequential(
             nn.Linear(global_tokens * width, 2 * width),
             nn.GELU(),
             nn.Linear(2 * width, width),
+        )
+        self.physical_projection = (
+            nn.Sequential(nn.Linear(global_tokens, width), nn.GELU(), nn.Linear(width, width))
+            if physical_bypass else None
         )
         if not math.isfinite(time_frequency_max) or time_frequency_max < 1:
             raise ValueError("Maximum time angular frequency must be finite and at least one")
@@ -28,8 +32,12 @@ class GlobalTimeEncoder(nn.Module):
             nn.Linear(2 * width, 2 * width), nn.GELU(), nn.Linear(2 * width, width)
         )
 
-    def forward(self, global_features, time):
+    def forward(self, global_features, time, *, physical=None):
         global_embedding = self.global_projection(global_features.flatten(1))
+        if self.physical_projection is not None:
+            if physical is None or physical.shape != global_features.shape[:2]:
+                raise ValueError("Expected standardized physical conditions [B, 4]")
+            global_embedding = global_embedding + self.physical_projection(physical)
         time_embedding = self.time_projection(fourier_features(time.squeeze(-1), self.time_frequencies))
         return self.fusion(torch.cat((global_embedding, time_embedding), dim=-1))
 
@@ -92,10 +100,24 @@ class DualConditionedFlowBlock(nn.Module):
         return state + self.ffn(self.ffn_norm(state, condition))
 
 
+class IndependentVelocityHeads(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.heads = nn.ModuleDict({
+            target: nn.Sequential(nn.Linear(width, 24), nn.GELU(), nn.Linear(24, 1))
+            for target in ("Cl", "Cd", "CM")
+        })
+
+    def forward(self, state):
+        state = self.norm(state)
+        return torch.cat([head(state) for head in self.heads.values()], dim=-1)
+
+
 class DPFT(nn.Module):
     """Map CPJE features, a three-channel residual state, and FM time to velocity."""
 
-    def __init__(self, *, time_frequency_max=1000.0):
+    def __init__(self, *, time_frequency_max=1000.0, physical_bypass=False, independent_velocity_heads=False):
         super().__init__()
         self.global_tokens = 4
         self.channels = 3
@@ -107,7 +129,8 @@ class DPFT(nn.Module):
         self.register_buffer("theta", theta.float(), persistent=False)
 
         self.condition_encoder = GlobalTimeEncoder(
-            self.width, self.global_tokens, time_frequency_max=time_frequency_max
+            self.width, self.global_tokens, time_frequency_max=time_frequency_max,
+            physical_bypass=physical_bypass,
         )
         self.memory_norm = nn.LayerNorm(self.width)
         self.state_conv = nn.Conv1d(self.channels, self.width, 5, padding=2, padding_mode="circular")
@@ -115,12 +138,15 @@ class DPFT(nn.Module):
         self.blocks = nn.ModuleList(
             DualConditionedFlowBlock(self.width, heads=4, harmonics=harmonics) for _ in range(3)
         )
-        self.decoder = nn.Sequential(
-            nn.LayerNorm(self.width), nn.Linear(self.width, self.width), nn.GELU(),
-            nn.Linear(self.width, self.channels),
-        )
+        if independent_velocity_heads:
+            self.decoder = IndependentVelocityHeads(self.width)
+        else:
+            self.decoder = nn.Sequential(
+                nn.LayerNorm(self.width), nn.Linear(self.width, self.width), nn.GELU(),
+                nn.Linear(self.width, self.channels),
+            )
 
-    def forward(self, global_features, aero_features, residual_state, time, *, theta=None):
+    def forward(self, global_features, aero_features, residual_state, time, *, theta=None, physical=None):
         """Return velocities [B, 3, 160] in Cl, Cd, CM order."""
         if residual_state.ndim != 3 or residual_state.shape[1:] != (self.channels, self.n_theta):
             raise ValueError("Expected residual state [B, 3, 160]")
@@ -137,7 +163,7 @@ class DPFT(nn.Module):
         theta = theta.to(residual_state)
         relative_features = fourier_features(theta[:, None] - theta[None, :], self.orders)
 
-        condition = self.condition_encoder(global_features, time)
+        condition = self.condition_encoder(global_features, time, physical=physical)
         memory = self.memory_norm(aero_features.flatten(1, 2))
         state = self.state_conv(residual_state).transpose(1, 2)
         state = state + self.position(fourier_features(theta, self.orders))
