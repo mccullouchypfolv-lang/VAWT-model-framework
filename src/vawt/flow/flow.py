@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from ..archs import CPJE
 from .dpft import DPFT
 from .gp import sample_prior
+from .target_aware import TargetAwareVelocity
 
 
 def linear_path(source, target, time):
@@ -16,23 +17,44 @@ def linear_path(source, target, time):
 
 class ResidualFlow(nn.Module):
     def __init__(self, *, standardize_cpje_conditions=False, time_frequency_max=1000.0,
-                 physical_bypass=False, independent_velocity_heads=False):
+                 physical_bypass=False, independent_velocity_heads=False, target_aware=False):
         super().__init__()
         if physical_bypass and not standardize_cpje_conditions:
             raise ValueError("The physical bypass requires training-fitted condition standardization")
+        if target_aware and not (physical_bypass and independent_velocity_heads):
+            raise ValueError("Target-aware flow requires physical bypass and independent heads")
         self.physical_bypass = physical_bypass
+        self.target_aware = target_aware
         self.cpje = CPJE(standardize_conditions=standardize_cpje_conditions)
-        self.dpft = DPFT(time_frequency_max=time_frequency_max, physical_bypass=physical_bypass,
-                         independent_velocity_heads=independent_velocity_heads)
+        if target_aware:
+            self.dpft = TargetAwareVelocity(time_frequency_max=time_frequency_max)
+        else:
+            self.dpft = DPFT(time_frequency_max=time_frequency_max, physical_bypass=physical_bypass,
+                             independent_velocity_heads=independent_velocity_heads)
 
     def encode_conditions(self, conditions, lf, theta):
         global_features, aero_features = self.cpje(conditions, lf, theta)
         physical = self.cpje.normalize_conditions(conditions) if self.physical_bypass else None
         return global_features, aero_features, physical
 
-    def forward(self, conditions, lf, state, time, theta):
+    def condition_velocity(self, conditions, lf, theta):
+        if self.target_aware:
+            global_features, aero_features, relation_bias = self.cpje(conditions, lf, theta, return_relation_bias=True)
+            physical = self.cpje.normalize_conditions(conditions)
+
+            def predict(state, time):
+                return self.dpft(global_features, aero_features, state, time, theta=theta,
+                                 physical=physical, relation_bias=relation_bias)
+            return predict
+
         global_features, aero_features, physical = self.encode_conditions(conditions, lf, theta)
-        return self.dpft(global_features, aero_features, state, time, theta=theta, physical=physical)
+
+        def predict(state, time):
+            return self.dpft(global_features, aero_features, state, time, theta=theta, physical=physical)
+        return predict
+
+    def forward(self, conditions, lf, state, time, theta):
+        return self.condition_velocity(conditions, lf, theta)(state, time)
 
     def loss(self, batch, theta, *, generator=None):
         target = batch["residual"]

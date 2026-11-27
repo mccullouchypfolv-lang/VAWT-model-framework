@@ -36,7 +36,7 @@ def run_epoch(model, batches, theta, *, generator, optimizer=None):
 
 
 def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
-          batch_size=8, learning_rate=0.001, weight_decay=0.0001, seed=42):
+          batch_size=8, learning_rate=0.001, weight_decay=0.0001, seed=42, target_aware=True):
     if epochs < 1 or batch_size < 1:
         raise ValueError("Epochs and batch size must be positive")
     torch.manual_seed(seed)
@@ -53,7 +53,7 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
     val_rng = torch.Generator(device=device)
     model = ResidualFlow(
         standardize_cpje_conditions=True, time_frequency_max=TIME_FREQUENCY_MAX,
-        physical_bypass=True, independent_velocity_heads=True,
+        physical_bypass=True, independent_velocity_heads=True, target_aware=target_aware,
     )
     model.cpje.fit_condition_normalization(training_data.conditions)
     model.to(device)
@@ -79,6 +79,7 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
                 "time_frequency_max": TIME_FREQUENCY_MAX,
                 "physical_bypass": True,
                 "independent_velocity_heads": True,
+                "target_aware": target_aware,
                 "residual_mean": training_data.normalizer.mean,
                 "residual_std": training_data.normalizer.std,
                 "lf_checkpoint": str(lf_checkpoint),
@@ -91,6 +92,7 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
         "standardize_cpje_conditions": True, "dpft_blocks": len(model.dpft.blocks),
         "time_frequency_max": TIME_FREQUENCY_MAX,
         "physical_bypass": True, "independent_velocity_heads": True,
+        "target_aware": target_aware,
         "weight_decay": weight_decay, "splits": {name: len(data) for name, data in datasets.items()},
     }
     (output / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -109,10 +111,12 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--weight-decay", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--target-aware", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the default two-block target-aware velocity field")
     args = parser.parse_args()
     train(args.data, args.splits, args.lf_checkpoint, args.output, args.epochs, args.device,
           batch_size=args.batch_size, learning_rate=args.learning_rate,
-          weight_decay=args.weight_decay, seed=args.seed)
+          weight_decay=args.weight_decay, seed=args.seed, target_aware=args.target_aware)
 
 
 if __name__ == "__main__":

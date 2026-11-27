@@ -120,7 +120,7 @@ class CPJE(nn.Module):
             return conditions
         return (conditions - self.condition_mean) / self.condition_std
 
-    def forward(self, conditions, lf_curves, theta):
+    def forward(self, conditions, lf_curves, theta, *, return_relation_bias=False):
         if conditions.ndim != 2 or conditions.shape[1] != self.parameters_count:
             raise ValueError("Expected conditions with shape [B, 4]")
         conditions = self.normalize_conditions(conditions)
@@ -153,4 +153,6 @@ class CPJE(nn.Module):
         aerodynamic_features = tokens[:, self.parameters_count:].reshape(
             batch, self.variables, angles, self.width
         )
+        if return_relation_bias:
+            return global_features, aerodynamic_features, bias[:, self.parameters_count:, self.parameters_count:]
         return global_features, aerodynamic_features
