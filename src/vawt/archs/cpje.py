@@ -71,9 +71,11 @@ class CPJE(nn.Module):
     Returns global features [B, 4, 48] and aerodynamic features [B, 3, N, 48].
     """
 
-    def __init__(self):
+    def __init__(self, *, standardize_conditions=False):
         super().__init__()
         self.parameters_count = 4
+        self.register_buffer("condition_mean", torch.zeros(4) if standardize_conditions else None)
+        self.register_buffer("condition_std", torch.ones(4) if standardize_conditions else None)
         self.variables = 3
         self.width = 48
         self.kernel_size = 5
@@ -100,9 +102,24 @@ class CPJE(nn.Module):
             JointAttentionBlock(self.width, heads=4, expansion=2) for _ in range(2)
         )
 
+    @torch.no_grad()
+    def fit_condition_normalization(self, conditions):
+        if self.condition_mean is None:
+            raise ValueError("CPJE condition standardization is disabled")
+        if conditions.ndim != 2 or conditions.shape[1] != self.parameters_count or not len(conditions):
+            raise ValueError("Expected nonempty training conditions [B, 4]")
+        mean = conditions.mean(dim=0)
+        std = conditions.std(dim=0, correction=0)
+        if not (mean.isfinite().all() and std.isfinite().all() and (std > 0).all()):
+            raise ValueError("Each CPJE condition needs finite data and a positive training scale")
+        self.condition_mean.copy_(mean)
+        self.condition_std.copy_(std)
+
     def forward(self, conditions, lf_curves, theta):
         if conditions.ndim != 2 or conditions.shape[1] != self.parameters_count:
             raise ValueError("Expected conditions with shape [B, 4]")
+        if self.condition_mean is not None:
+            conditions = (conditions - self.condition_mean) / self.condition_std
         if lf_curves.ndim != 3 or lf_curves.shape[:2] != (conditions.shape[0], self.variables):
             raise ValueError("Expected LF curves with shape [B, 3, N]")
         batch, _, angles = lf_curves.shape

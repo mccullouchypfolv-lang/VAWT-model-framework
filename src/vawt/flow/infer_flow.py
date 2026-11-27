@@ -26,7 +26,10 @@ def rk4(velocity, initial_state, *, steps=128):
 
 def load_flow_checkpoint(path, *, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    model = ResidualFlow()
+    model = ResidualFlow(
+        standardize_cpje_conditions=checkpoint.get("standardize_cpje_conditions", False),
+        time_frequency_max=checkpoint.get("time_frequency_max", 1000.0),
+    )
     model.load_state_dict(checkpoint["model"])
     normalizer = ResidualNormalizer(checkpoint["residual_mean"], checkpoint["residual_std"])
     return model.to(device).eval(), normalizer

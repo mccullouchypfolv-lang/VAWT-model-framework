@@ -10,14 +10,17 @@ from ..periodic import fourier_features
 
 
 class GlobalTimeEncoder(nn.Module):
-    def __init__(self, width, global_tokens):
+    def __init__(self, width, global_tokens, *, time_frequency_max=1000.0):
         super().__init__()
         self.global_projection = nn.Sequential(
             nn.Linear(global_tokens * width, 2 * width),
             nn.GELU(),
             nn.Linear(2 * width, width),
         )
-        self.register_buffer("time_frequencies", torch.logspace(0, 3, width // 2), persistent=False)
+        if not math.isfinite(time_frequency_max) or time_frequency_max < 1:
+            raise ValueError("Maximum time angular frequency must be finite and at least one")
+        frequencies = torch.logspace(0, math.log10(time_frequency_max), width // 2)
+        self.register_buffer("time_frequencies", frequencies, persistent=False)
         self.time_projection = nn.Sequential(
             nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width)
         )
@@ -92,7 +95,7 @@ class DualConditionedFlowBlock(nn.Module):
 class DPFT(nn.Module):
     """Map CPJE features, a three-channel residual state, and FM time to velocity."""
 
-    def __init__(self):
+    def __init__(self, *, time_frequency_max=1000.0):
         super().__init__()
         self.global_tokens = 4
         self.channels = 3
@@ -103,7 +106,9 @@ class DPFT(nn.Module):
         theta = (torch.arange(self.n_theta, dtype=torch.float64) + 0.5) * (math.tau / self.n_theta)
         self.register_buffer("theta", theta.float(), persistent=False)
 
-        self.condition_encoder = GlobalTimeEncoder(self.width, self.global_tokens)
+        self.condition_encoder = GlobalTimeEncoder(
+            self.width, self.global_tokens, time_frequency_max=time_frequency_max
+        )
         self.memory_norm = nn.LayerNorm(self.width)
         self.state_conv = nn.Conv1d(self.channels, self.width, 5, padding=2, padding_mode="circular")
         self.position = nn.Linear(2 * harmonics, self.width, bias=False)

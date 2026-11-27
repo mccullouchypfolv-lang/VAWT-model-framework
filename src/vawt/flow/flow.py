@@ -15,10 +15,10 @@ def linear_path(source, target, time):
 
 
 class ResidualFlow(nn.Module):
-    def __init__(self):
+    def __init__(self, *, standardize_cpje_conditions=False, time_frequency_max=1000.0):
         super().__init__()
-        self.cpje = CPJE()
-        self.dpft = DPFT()
+        self.cpje = CPJE(standardize_conditions=standardize_cpje_conditions)
+        self.dpft = DPFT(time_frequency_max=time_frequency_max)
 
     def forward(self, conditions, lf, state, time, theta):
         global_features, aero_features = self.cpje(conditions, lf, theta)

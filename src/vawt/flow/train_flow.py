@@ -13,6 +13,9 @@ from .dataset import build_residual_datasets
 from .flow import ResidualFlow
 
 
+TIME_FREQUENCY_MAX = 8 * math.pi
+
+
 def run_epoch(model, batches, theta, *, generator, optimizer=None):
     training = optimizer is not None
     model.train(training)
@@ -48,7 +51,9 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
     val_batches = DataLoader(datasets["val"], batch_size=batch_size)
     train_rng = torch.Generator(device=device).manual_seed(seed)
     val_rng = torch.Generator(device=device)
-    model = ResidualFlow().to(device)
+    model = ResidualFlow(standardize_cpje_conditions=True, time_frequency_max=TIME_FREQUENCY_MAX)
+    model.cpje.fit_condition_normalization(training_data.conditions)
+    model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     output = Path(output)
@@ -66,6 +71,9 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
             best_val, best_epoch = val_mse, epoch
             torch.save({
                 "model": model.state_dict(),
+                "standardize_cpje_conditions": True,
+                "dpft_blocks": len(model.dpft.blocks),
+                "time_frequency_max": TIME_FREQUENCY_MAX,
                 "residual_mean": training_data.normalizer.mean,
                 "residual_std": training_data.normalizer.std,
                 "lf_checkpoint": str(lf_checkpoint),
@@ -75,6 +83,8 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
     report = {
         "best_epoch": best_epoch, "best_val_velocity_mse": best_val, "history": history,
         "seed": seed, "batch_size": batch_size, "learning_rate": learning_rate,
+        "standardize_cpje_conditions": True, "dpft_blocks": len(model.dpft.blocks),
+        "time_frequency_max": TIME_FREQUENCY_MAX,
         "weight_decay": weight_decay, "splits": {name: len(data) for name, data in datasets.items()},
     }
     (output / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -87,7 +97,7 @@ def main():
     parser.add_argument("--splits", type=Path, required=True)
     parser.add_argument("--lf-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=0.001)
