@@ -14,16 +14,20 @@ from .flow import ResidualFlow
 
 
 TIME_FREQUENCY_MAX = 8 * math.pi
+TPC_WEIGHT = 0.25
 
 
-def run_epoch(model, batches, theta, *, generator, optimizer=None):
+def run_epoch(model, batches, theta, *, generator, optimizer=None, tpc_weight=0.0):
     training = optimizer is not None
     model.train(training)
     total = 0.0
+    tpc_total = 0.0
     with torch.set_grad_enabled(training):
         for batch in batches:
             batch = {key: value.to(theta.device) for key, value in batch.items() if key != "hf"}
-            loss = model.loss(batch, theta, generator=generator)
+            fm, tpc = model.loss_terms(batch, theta, generator=generator,
+                                       mirror_tpc=training and tpc_weight > 0)
+            loss = fm if tpc is None else fm + tpc_weight * tpc
             value = loss.detach().item()
             if not math.isfinite(value):
                 raise FloatingPointError("Nonfinite flow matching MSE")
@@ -31,14 +35,21 @@ def run_epoch(model, batches, theta, *, generator, optimizer=None):
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-            total += value * len(batch["conditions"])
-    return total / len(batches.dataset)
+            count = len(batch["conditions"])
+            total += fm.detach().item() * count
+            if tpc is not None:
+                tpc_total += tpc.detach().item() * count
+    size = len(batches.dataset)
+    return total / size, tpc_total / size
 
 
 def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
-          batch_size=8, learning_rate=0.001, weight_decay=0.0001, seed=42, target_aware=True):
+          batch_size=8, learning_rate=0.001, weight_decay=0.0001, seed=42, target_aware=True,
+          tpc_weight=TPC_WEIGHT):
     if epochs < 1 or batch_size < 1:
         raise ValueError("Epochs and batch size must be positive")
+    if not math.isfinite(tpc_weight) or tpc_weight < 0:
+        raise ValueError("TPC weight must be finite and nonnegative")
     torch.manual_seed(seed)
     solver = LF_Solver.from_checkpoint(lf_checkpoint).to(device)
     datasets = build_residual_datasets(data_path, split_path, solver)
@@ -64,10 +75,15 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
     best_val = float("inf")
     history = []
     for epoch in range(1, epochs + 1):
-        train_mse = run_epoch(model, train_batches, theta, generator=train_rng, optimizer=optimizer)
+        train_mse, train_tpc_mse = run_epoch(
+            model, train_batches, theta, generator=train_rng, optimizer=optimizer, tpc_weight=tpc_weight,
+        )
         # Reuse validation times and sources so the score tracks model changes.
-        val_mse = run_epoch(model, val_batches, theta, generator=val_rng.manual_seed(seed + 1))
+        val_mse, _ = run_epoch(model, val_batches, theta, generator=val_rng.manual_seed(seed + 1))
         row = {"epoch": epoch, "train_velocity_mse": train_mse, "val_velocity_mse": val_mse}
+        if tpc_weight:
+            row["train_tpc_mse"] = train_tpc_mse
+            row["train_total_loss"] = train_mse + tpc_weight * train_tpc_mse
         history.append(row)
         print(json.dumps(row), flush=True)
         if val_mse < best_val:
@@ -84,6 +100,8 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
                 "residual_std": training_data.normalizer.std,
                 "lf_checkpoint": str(lf_checkpoint),
                 "epoch": epoch,
+                "tpc_weight": tpc_weight,
+                "tpc_pairing": "mirror",
             }, output / "best.pt")
 
     report = {
@@ -93,6 +111,7 @@ def train(data_path, split_path, lf_checkpoint, output, epochs, device, *,
         "time_frequency_max": TIME_FREQUENCY_MAX,
         "physical_bypass": True, "independent_velocity_heads": True,
         "target_aware": target_aware,
+        "tpc_weight": tpc_weight, "tpc_pairing": "mirror",
         "weight_decay": weight_decay, "splits": {name: len(data) for name, data in datasets.items()},
     }
     (output / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -113,10 +132,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target-aware", action=argparse.BooleanOptionalAction, default=True,
                         help="Use the default two-block target-aware velocity field")
+    parser.add_argument("--tpc-weight", type=float, default=TPC_WEIGHT,
+                        help="Mirror-time consistency weight (0 disables it)")
     args = parser.parse_args()
     train(args.data, args.splits, args.lf_checkpoint, args.output, args.epochs, args.device,
           batch_size=args.batch_size, learning_rate=args.learning_rate,
-          weight_decay=args.weight_decay, seed=args.seed, target_aware=args.target_aware)
+          weight_decay=args.weight_decay, seed=args.seed, target_aware=args.target_aware,
+          tpc_weight=args.tpc_weight)
 
 
 if __name__ == "__main__":

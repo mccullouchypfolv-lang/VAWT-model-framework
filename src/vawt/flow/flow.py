@@ -57,11 +57,23 @@ class ResidualFlow(nn.Module):
         return self.condition_velocity(conditions, lf, theta)(state, time)
 
     def loss(self, batch, theta, *, generator=None):
+        fm, _ = self.loss_terms(batch, theta, generator=generator)
+        return fm
+
+    def loss_terms(self, batch, theta, *, generator=None, mirror_tpc=False):
+        """Compute velocity supervision and optional mirror-time consistency."""
         target = batch["residual"]
         source = sample_prior(target, generator=generator)
         time = torch.rand(
             (len(target), 1), device=target.device, dtype=target.dtype, generator=generator
         )
         state, velocity = linear_path(source, target, time)
-        prediction = self(batch["conditions"], batch["lf"], state, time, theta)
-        return F.mse_loss(prediction, velocity)
+        predict = self.condition_velocity(batch["conditions"], batch["lf"], theta)
+        prediction = predict(state, time)
+        fm = F.mse_loss(prediction, velocity)
+        if not mirror_tpc:
+            return fm, None
+        mirror_time = 1 - time
+        mirror_state, _ = linear_path(source, target, mirror_time)
+        tpc = F.mse_loss(prediction, predict(mirror_state, mirror_time))
+        return fm, tpc
